@@ -13,11 +13,11 @@ import (
 type Status string
 
 const (
-	StatusPending    Status = "pending"     // persisted + enqueued, not yet picked up
+	StatusPending    Status = "pending"     // enqueued (or re-enqueued for retry), not yet picked up
 	StatusProcessing Status = "processing"  // claimed by a worker, handler running
 	StatusCompleted  Status = "completed"   // handler succeeded; result is set
-	StatusFailed     Status = "failed"      // handler errored (may be retried later)
-	StatusDeadLetter Status = "dead_letter" // retries exhausted (used in a later step)
+	StatusFailed     Status = "failed"      // gave up after exhausting retries; recorded in dead_letter_queue
+	StatusDeadLetter Status = "dead_letter" // reserved: a dead-lettered job is currently marked "failed" + a dead_letter_queue row
 )
 
 // Job is one unit of work. Payload and Result are kept as raw JSON so the queue

@@ -1,14 +1,17 @@
 // Command worker consumes job ids from Redis, runs the matching handler, and
-// writes the outcome back to Postgres.
+// writes the outcome back to Postgres. Alongside the consume loop it runs a
+// poller that promotes due delayed jobs (retry backoff) back onto the work list.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,14 +24,31 @@ import (
 	"github.com/mubeendevelops/dispatch-go/internal/store"
 )
 
-// brpopTimeout bounds each blocking pop so the worker notices a shutdown signal
-// between attempts rather than blocking forever.
-const brpopTimeout = 5 * time.Second
+const (
+	// brpopTimeout bounds each blocking pop so the worker notices a shutdown
+	// signal between attempts rather than blocking forever.
+	brpopTimeout = 5 * time.Second
+
+	// pollInterval is how often the delayed-queue poller checks for jobs whose
+	// backoff has elapsed. It is shorter than the smallest backoff (2s) so a due
+	// retry waits at most ~1s extra; a smaller value cuts latency at the cost of
+	// more Redis round-trips.
+	pollInterval = 1 * time.Second
+
+	// promoteBatch caps how many due jobs a single poll moves per queue, so a
+	// large backlog drains over several ticks instead of one oversized command.
+	promoteBatch = 100
+
+	// maxBackoff caps the exponential delay. 2^attempts seconds grows extremely
+	// fast, so without a ceiling a large max_retries would schedule an absurd --
+	// and eventually int64-overflowing -- wait.
+	maxBackoff = 1 * time.Hour
+)
 
 func main() {
 	cfg := config.Load()
 
-	// Root context is cancelled on SIGINT/SIGTERM to unwind the run loop cleanly.
+	// Root context is cancelled on SIGINT/SIGTERM to unwind both loops cleanly.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -52,12 +72,20 @@ func main() {
 	}
 
 	log.Printf("worker watching queues %v", cfg.Queues)
-	run(ctx, st, q, cfg.Queues)
+
+	// Run the consume loop and the delayed-queue poller side by side; both unwind
+	// when ctx is cancelled, and wg.Wait keeps main alive until they do.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); consume(ctx, st, q, cfg.Queues) }()
+	go func() { defer wg.Done(); poll(ctx, q, cfg.Queues) }()
+	wg.Wait()
+
 	log.Println("worker stopped")
 }
 
-// run is the consume loop: block for a job id, process it, repeat until shutdown.
-func run(ctx context.Context, st *store.Store, q *queue.Queue, queues []string) {
+// consume is the work loop: block for a job id, process it, repeat until shutdown.
+func consume(ctx context.Context, st *store.Store, q *queue.Queue, queues []string) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -77,14 +105,43 @@ func run(ctx context.Context, st *store.Store, q *queue.Queue, queues []string) 
 			}
 		}
 
-		if err := process(ctx, st, jobID); err != nil {
+		if err := process(ctx, st, q, jobID); err != nil {
 			log.Printf("job %s (queue %s): %v", jobID, queueName, err)
 		}
 	}
 }
 
-// process loads the job, marks it processing, runs its handler, and records the result.
-func process(ctx context.Context, st *store.Store, jobID string) error {
+// poll promotes due delayed jobs (retries whose backoff has elapsed) back onto
+// their work lists, once per pollInterval, until shutdown.
+func poll(ctx context.Context, q *queue.Queue, queues []string) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			for _, name := range queues {
+				moved, err := q.PromoteDue(ctx, name, now, promoteBatch)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					log.Printf("promote due (queue %s): %v", name, err)
+					continue
+				}
+				if moved > 0 {
+					log.Printf("promoted %d due job(s) onto queue %s", moved, name)
+				}
+			}
+		}
+	}
+}
+
+// process loads the job, marks it processing, runs its handler, and records the
+// outcome -- success, a scheduled retry, or dead-lettering.
+func process(ctx context.Context, st *store.Store, q *queue.Queue, jobID string) error {
 	id, err := uuid.Parse(jobID)
 	if err != nil {
 		return err // a malformed id maps to no row; nothing to do but drop it
@@ -100,20 +157,71 @@ func process(ctx context.Context, st *store.Store, jobID string) error {
 
 	result, handlerErr := handle(job)
 	if handlerErr != nil {
-		// Retry/backoff/dead-letter handling arrives in a later step; for now we
-		// just record the failure.
-		return st.MarkFailed(ctx, id, handlerErr.Error())
+		return handleFailure(ctx, st, q, job, handlerErr)
 	}
 
 	log.Printf("job %s completed (type=%s)", id, job.JobType)
 	return st.MarkCompleted(ctx, id, result)
 }
 
-// handle is the stand-in for the handler registry (a later step). Every job type
-// currently runs the echo handler: it returns the job's payload unchanged.
-func handle(job *models.Job) (json.RawMessage, error) {
-	if len(job.Payload) == 0 {
-		return json.RawMessage(`{}`), nil
+// handleFailure applies the retry policy when a handler errors:
+//
+//   - Bump the attempt count. While it stays below max_retries, schedule another
+//     run after an exponential backoff of 2^attempts seconds (2s, 4s, 8s, ...).
+//   - Once the attempt count reaches max_retries, give up: mark the job failed
+//     and record it in the dead-letter queue.
+//
+// State is persisted to Postgres BEFORE the delayed re-enqueue, matching the
+// project's "persist before enqueue" rule: a crash in between leaves a
+// recoverable row, never a queued id pointing at stale state.
+func handleFailure(ctx context.Context, st *store.Store, q *queue.Queue, job *models.Job, handlerErr error) error {
+	attempts := job.RetryCount + 1 // this attempt just failed
+
+	// Out of retries: dead-letter and stop.
+	if attempts >= job.MaxRetries {
+		log.Printf("job %s dead-lettered after %d attempt(s): %v", job.ID, attempts, handlerErr)
+		return st.DeadLetter(ctx, job.ID, attempts, handlerErr.Error())
 	}
-	return job.Payload, nil
+
+	// Otherwise schedule a retry after an exponential backoff.
+	backoff := backoffFor(attempts)
+	if err := st.MarkForRetry(ctx, job.ID, attempts, handlerErr.Error()); err != nil {
+		return err
+	}
+	if err := q.EnqueueDelayed(ctx, job.QueueName, job.ID.String(), time.Now().Add(backoff)); err != nil {
+		return err
+	}
+	log.Printf("job %s failed (attempt %d/%d), retrying in %s: %v",
+		job.ID, attempts, job.MaxRetries, backoff, handlerErr)
+	return nil
+}
+
+// backoffFor returns the delay before the given attempt is retried: 2^attempt
+// seconds, clamped to maxBackoff.
+func backoffFor(attempt int) time.Duration {
+	if attempt >= 30 { // 2^30 s already dwarfs maxBackoff; avoid an oversized shift
+		return maxBackoff
+	}
+	if d := time.Duration(1<<attempt) * time.Second; d < maxBackoff {
+		return d
+	}
+	return maxBackoff
+}
+
+// handle dispatches a job to its handler. This is a minimal stand-in for the
+// handler registry (a later step):
+//
+//   - "always_fail": a test handler that always errors, so we can watch a job
+//     exhaust its retries and land in the dead-letter queue.
+//   - everything else: "echo", which returns the payload unchanged.
+func handle(job *models.Job) (json.RawMessage, error) {
+	switch job.JobType {
+	case "always_fail":
+		return nil, fmt.Errorf("always_fail: deliberate failure for testing retries")
+	default:
+		if len(job.Payload) == 0 {
+			return json.RawMessage(`{}`), nil
+		}
+		return job.Payload, nil
+	}
 }

@@ -95,15 +95,47 @@ func (s *Store) MarkCompleted(ctx context.Context, id uuid.UUID, result json.Raw
 	return err
 }
 
-// MarkFailed records the error message. Retry/backoff/dead-letter handling is
-// added in a later step; for now a failed job simply stops here.
-func (s *Store) MarkFailed(ctx context.Context, id uuid.UUID, errMsg string) error {
+// MarkForRetry records a failed attempt that will be retried later: it bumps
+// retry_count, stores the error, and sets the job back to pending. The job stays
+// out of the work list until the delayed-queue poller promotes it once its
+// backoff elapses (see queue.PromoteDue). retryCount is the new, post-increment
+// value, computed by the caller.
+func (s *Store) MarkForRetry(ctx context.Context, id uuid.UUID, retryCount int, errMsg string) error {
 	const q = `
 		UPDATE jobs
-		SET status = $2, error_message = $3, completed_at = now()
+		SET status = $2, retry_count = $3, error_message = $4
 		WHERE id = $1`
-	_, err := s.pool.Exec(ctx, q, id, models.StatusFailed, errMsg)
+	_, err := s.pool.Exec(ctx, q, id, models.StatusPending, retryCount, errMsg)
 	return err
+}
+
+// DeadLetter is the terminal failure path: the job has exhausted its retries. It
+// marks the job failed AND records it in dead_letter_queue, both inside one
+// transaction so the job status and the DLQ audit row can never diverge. The
+// INSERT is idempotent (ON CONFLICT) so re-running the operation is safe.
+func (s *Store) DeadLetter(ctx context.Context, id uuid.UUID, attempts int, reason string) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) // no-op after a successful Commit
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE jobs
+		SET status = $2, retry_count = $3, error_message = $4, completed_at = now()
+		WHERE id = $1`,
+		id, models.StatusFailed, attempts, reason); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO dead_letter_queue (job_id, reason, attempts)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (job_id) DO UPDATE
+		SET reason = EXCLUDED.reason, attempts = EXCLUDED.attempts`,
+		id, reason, attempts); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // scanJob reads one row into job using the jobColumns order.
