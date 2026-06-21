@@ -1,0 +1,39 @@
+# Local infrastructure only: Postgres + Redis. The Go services (api, worker,
+# scheduler) run on the host, so they are not defined here.
+#
+# Note: Postgres is published on host port 5433 (not 5432) to avoid clashing with
+# a Postgres instance that may already be running on the host. Keep DATABASE_URL
+# in .env in sync with this.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dispatch
+      POSTGRES_PASSWORD: dispatch
+      POSTGRES_DB: dispatch
+    ports:
+      - "5433:5432"
+    volumes:
+      - dispatch_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dispatch -d dispatch"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - dispatch_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  dispatch_pgdata:
+  dispatch_redisdata:
