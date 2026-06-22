@@ -124,9 +124,37 @@ curl http://localhost:8080/api/v1/jobs/<job_id>
 ```
 
 Once a worker has processed it, `status` becomes `completed` and `result` holds
-the handler output. Two handlers exist so far (a real registry comes later):
-`echo` (the default — returns the payload unchanged) and `always_fail` (a test
-handler that always errors, used to exercise retries; see below).
+the handler output. Which handler runs is chosen by `job_type` via a registry —
+see [Job types](#job-types).
+
+## Job types
+
+`job_type` selects the handler that runs a job. Handlers live in `internal/jobs`
+and are registered in one place — `jobs.DefaultRegistry()`. An unrecognized
+`job_type` fails with a clear error (`no handler registered for job_type "..."`)
+and then follows the normal retry/dead-letter path.
+
+| `job_type`    | Payload fields                     | Result on success            | Notes                                             |
+| ------------- | ---------------------------------- | ---------------------------- | ------------------------------------------------- |
+| `send_email`  | `to` (required), `subject`, `body` | `{message_id, to, status}`   | Simulated send; returns a fake message id.        |
+| `export_pdf`  | `document_id` (optional)           | `{document_id, url, status}` | Simulated slow job: sleeps ~3s, returns fake URL. |
+| `echo`        | any JSON object                    | the payload, unchanged       | Smoke-test handler.                               |
+| `always_fail` | any JSON object                    | —                            | Always errors; exercises retries + the DLQ.       |
+
+```bash
+# send_email
+curl -s -X POST http://localhost:8080/api/v1/jobs/enqueue \
+  -H "Content-Type: application/json" \
+  -d '{"job_type":"send_email","payload":{"to":"user@example.com","subject":"Hi"}}'
+
+# export_pdf (completes after ~3s)
+curl -s -X POST http://localhost:8080/api/v1/jobs/enqueue \
+  -H "Content-Type: application/json" \
+  -d '{"job_type":"export_pdf","payload":{"document_id":"doc_123"}}'
+```
+
+**Adding a job type:** implement the `jobs.JobHandler` interface in
+`internal/jobs` and add one `Register(...)` line to `jobs.DefaultRegistry()`.
 
 ## How to verify
 
@@ -226,8 +254,9 @@ internal/
   config/      env-var configuration loader
   models/      domain types (Job, Status)
   store/       Postgres persistence + migration runner
-  queue/       Redis-backed work queue (LPUSH / BRPOP)
+  queue/       Redis-backed work queue (LPUSH / BRPOP + delayed set)
   handlers/    HTTP handlers, routing, JSON responses
+  jobs/        job_type -> handler registry and the built-in job handlers
 migrations/    SQL migrations (embedded into the binary)
 frontend/      Next.js dashboard (later step)
 docker-compose.yml
@@ -235,5 +264,5 @@ docker-compose.yml
 
 ## Roadmap
 
-See the status checklist in `CLAUDE.md`. Next up: a handler registry, the
-scheduler, full stats, and the dashboard.
+See the status checklist in `CLAUDE.md`. Next up: the scheduler, full stats, and
+the dashboard.

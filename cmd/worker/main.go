@@ -5,9 +5,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -19,6 +17,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/mubeendevelops/dispatch-go/internal/config"
+	"github.com/mubeendevelops/dispatch-go/internal/jobs"
 	"github.com/mubeendevelops/dispatch-go/internal/models"
 	"github.com/mubeendevelops/dispatch-go/internal/queue"
 	"github.com/mubeendevelops/dispatch-go/internal/store"
@@ -71,13 +70,18 @@ func main() {
 		log.Fatalf("worker: redis: %v", err)
 	}
 
+	// The registry maps job_type -> handler. All handlers are wired up in
+	// jobs.DefaultRegistry; the worker below stays generic.
+	registry := jobs.DefaultRegistry()
+
 	log.Printf("worker watching queues %v", cfg.Queues)
+	log.Printf("registered job types: %v", registry.Types())
 
 	// Run the consume loop and the delayed-queue poller side by side; both unwind
 	// when ctx is cancelled, and wg.Wait keeps main alive until they do.
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); consume(ctx, st, q, cfg.Queues) }()
+	go func() { defer wg.Done(); consume(ctx, st, q, registry, cfg.Queues) }()
 	go func() { defer wg.Done(); poll(ctx, q, cfg.Queues) }()
 	wg.Wait()
 
@@ -85,7 +89,7 @@ func main() {
 }
 
 // consume is the work loop: block for a job id, process it, repeat until shutdown.
-func consume(ctx context.Context, st *store.Store, q *queue.Queue, queues []string) {
+func consume(ctx context.Context, st *store.Store, q *queue.Queue, registry *jobs.Registry, queues []string) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -105,7 +109,7 @@ func consume(ctx context.Context, st *store.Store, q *queue.Queue, queues []stri
 			}
 		}
 
-		if err := process(ctx, st, q, jobID); err != nil {
+		if err := process(ctx, st, q, registry, jobID); err != nil {
 			log.Printf("job %s (queue %s): %v", jobID, queueName, err)
 		}
 	}
@@ -139,9 +143,10 @@ func poll(ctx context.Context, q *queue.Queue, queues []string) {
 	}
 }
 
-// process loads the job, marks it processing, runs its handler, and records the
-// outcome -- success, a scheduled retry, or dead-lettering.
-func process(ctx context.Context, st *store.Store, q *queue.Queue, jobID string) error {
+// process loads the job, marks it processing, dispatches it to its handler via
+// the registry, and records the outcome -- success, a scheduled retry, or
+// dead-lettering.
+func process(ctx context.Context, st *store.Store, q *queue.Queue, registry *jobs.Registry, jobID string) error {
 	id, err := uuid.Parse(jobID)
 	if err != nil {
 		return err // a malformed id maps to no row; nothing to do but drop it
@@ -155,7 +160,11 @@ func process(ctx context.Context, st *store.Store, q *queue.Queue, jobID string)
 		return err
 	}
 
-	result, handlerErr := handle(job)
+	// Dispatch by job_type through the registry. Before this refactor the worker
+	// ran a hardcoded switch on job.JobType here; now it knows nothing about
+	// specific types -- the registry looks up the handler, runs it, and returns
+	// the encoded result (or an error for an unknown type / handler failure).
+	result, handlerErr := registry.Dispatch(ctx, job.JobType, job.Payload)
 	if handlerErr != nil {
 		return handleFailure(ctx, st, q, job, handlerErr)
 	}
@@ -206,22 +215,4 @@ func backoffFor(attempt int) time.Duration {
 		return d
 	}
 	return maxBackoff
-}
-
-// handle dispatches a job to its handler. This is a minimal stand-in for the
-// handler registry (a later step):
-//
-//   - "always_fail": a test handler that always errors, so we can watch a job
-//     exhaust its retries and land in the dead-letter queue.
-//   - everything else: "echo", which returns the payload unchanged.
-func handle(job *models.Job) (json.RawMessage, error) {
-	switch job.JobType {
-	case "always_fail":
-		return nil, fmt.Errorf("always_fail: deliberate failure for testing retries")
-	default:
-		if len(job.Payload) == 0 {
-			return json.RawMessage(`{}`), nil
-		}
-		return job.Payload, nil
-	}
 }
