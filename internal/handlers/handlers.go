@@ -11,23 +11,24 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 
+	"github.com/mubeendevelops/dispatch-go/internal/enqueue"
 	"github.com/mubeendevelops/dispatch-go/internal/models"
 	"github.com/mubeendevelops/dispatch-go/internal/queue"
 	"github.com/mubeendevelops/dispatch-go/internal/store"
 )
 
-// defaultMaxRetries applies when the caller omits max_retries.
-const defaultMaxRetries = 3
-
 // Handler holds the dependencies the routes need.
 type Handler struct {
-	store *store.Store
-	queue *queue.Queue
+	store    *store.Store
+	queue    *queue.Queue
+	enqueuer *enqueue.Enqueuer
 }
 
-// New wires up a Handler.
+// New wires up a Handler. The enqueuer is the shared persist-before-enqueue path,
+// the same one cmd/scheduler uses, so jobs enter the system identically however
+// they are produced.
 func New(s *store.Store, q *queue.Queue) *Handler {
-	return &Handler{store: s, queue: q}
+	return &Handler{store: s, queue: q, enqueuer: enqueue.New(s, q)}
 }
 
 // Routes returns the API router. It is mounted at "/" by cmd/api.
@@ -61,38 +62,32 @@ func (h *Handler) enqueueJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply defaults.
-	if req.QueueName == "" {
-		req.QueueName = "default"
-	}
-	if len(req.Payload) == 0 {
-		req.Payload = json.RawMessage(`{}`)
-	}
-	maxRetries := defaultMaxRetries
+	// max_retries is the one default the shared enqueuer can't infer for us: 0 is a
+	// valid budget a caller may choose deliberately, so "unset" (nil) is resolved
+	// here. The remaining defaults (id, queue_name, payload, status) are applied by
+	// the enqueuer so every producer fills them identically.
+	maxRetries := enqueue.DefaultMaxRetries
 	if req.MaxRetries != nil {
 		maxRetries = *req.MaxRetries
 	}
 
 	job := &models.Job{
-		ID:         uuid.New(),
 		QueueName:  req.QueueName,
 		JobType:    req.JobType,
 		Payload:    req.Payload,
-		Status:     models.StatusPending,
 		MaxRetries: maxRetries,
 	}
 
-	// Persist BEFORE enqueueing (CLAUDE.md): Postgres is the source of truth, so a
-	// crash after the insert but before the LPUSH leaves a recoverable row -- never
-	// a queued id that points at no row.
-	if err := h.store.CreateJob(r.Context(), job); err != nil {
+	// Persist BEFORE enqueueing (CLAUDE.md), via the shared producer path. A
+	// returned ErrEnqueueAfterPersist means the row is durable but the Redis push
+	// failed -- a recoverable state we report distinctly from failing to persist
+	// at all. A reconciler can later re-enqueue such rows.
+	if err := h.enqueuer.Submit(r.Context(), job); err != nil {
+		if errors.Is(err, enqueue.ErrEnqueueAfterPersist) {
+			writeError(w, http.StatusInternalServerError, "job persisted but failed to enqueue")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to persist job")
-		return
-	}
-	if err := h.queue.Enqueue(r.Context(), job.QueueName, job.ID.String()); err != nil {
-		// The row exists but isn't queued. Surface it; a re-enqueue/reconciler path
-		// can recover these rows in a later step.
-		writeError(w, http.StatusInternalServerError, "job persisted but failed to enqueue")
 		return
 	}
 

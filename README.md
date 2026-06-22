@@ -9,8 +9,10 @@ verify. Enqueue a job over HTTP → it's persisted in Postgres and pushed to Red
 ## Architecture (so far)
 
 ```
-client ──HTTP──▶  api  ──┬─▶ Postgres (jobs table = source of truth)
-                         └─▶ Redis    (list per queue = work signal, holds job IDs)
+client ──HTTP──▶ api ──────┐
+scheduler ──cron (1/min)──▶┤  both producers persist to Postgres, THEN push the id to Redis
+                           ├─▶ Postgres (jobs = source of truth; job_schedules = recurring defs)
+                           └─▶ Redis    (list per queue = work signal, holds job IDs)
                                           │
                                   worker  ◀┘  BRPOP id → load job → run handler → save result
 ```
@@ -25,6 +27,11 @@ client ──HTTP──▶  api  ──┬─▶ Postgres (jobs table = source o
   back onto the work list once due. After it exhausts its retries it's marked
   `failed` and recorded in the `dead_letter_queue` table. See
   [Retries & the dead-letter queue](#retries--the-dead-letter-queue).
+- **Recurring jobs come from the scheduler.** `cmd/scheduler` reads cron-based
+  rows from `job_schedules` and produces jobs through the *same* persist-before-
+  enqueue path as the API. It advances each schedule's `next_run_at` cursor in
+  Postgres *before* enqueuing — that ordering is what stops it double-firing
+  across restarts. See [Recurring schedules](#recurring-schedules-the-scheduler).
 
 ## Stack
 
@@ -90,6 +97,35 @@ go run ./cmd/api
 go run ./cmd/worker
 # worker watching queues [default]
 ```
+
+### 6. Start the scheduler (in another terminal)
+
+```bash
+go run ./cmd/scheduler
+# scheduler started; checking schedules every 1m0s
+```
+
+The scheduler fires recurring jobs from the `job_schedules` table. The migrations
+seed one example — an `echo` job every minute — so within a minute you'll see it
+log a fire and a new job appear (the worker from step 5 then runs it). See
+[Recurring schedules](#recurring-schedules-the-scheduler).
+
+### Running all three services
+
+`api`, `worker`, and `scheduler` are independent processes that share Postgres +
+Redis. Start infra and apply migrations once, then run each in its own terminal:
+
+```bash
+docker compose up -d        # Postgres + Redis (or the docker run fallback above)
+go run ./cmd/api migrate    # create tables + seed the example schedule
+
+go run ./cmd/api            # terminal 1 — HTTP API on :8080
+go run ./cmd/worker         # terminal 2 — consumes the queue and runs jobs
+go run ./cmd/scheduler      # terminal 3 — fires recurring schedules
+```
+
+The worker is what actually executes jobs, so keep one running alongside the
+scheduler to watch scheduled echoes complete.
 
 ## API
 
@@ -242,6 +278,102 @@ redis-cli -p 6379 ZRANGE dispatch:delayed:default 0 -1 WITHSCORES
 > `docker exec <postgres-container> psql -U dispatch -d dispatch -c '…'` and
 > `docker exec <redis-container> redis-cli …`.
 
+## Recurring schedules (the scheduler)
+
+`cmd/scheduler` turns recurring definitions into real jobs. A row in the
+`job_schedules` table is a **cron expression** plus a **job template**
+(`job_type` + `payload`):
+
+| Column                 | Meaning                                                   |
+| ---------------------- | --------------------------------------------------------- |
+| `cron_expression`      | When to fire — standard 5-field crontab (e.g. `* * * * *`).|
+| `job_type` + `payload` | The job to enqueue each time it fires.                    |
+| `enabled`              | Turn a schedule off without deleting it.                  |
+| `last_run_at`          | When it last fired (`NULL` until the first).              |
+| `next_run_at`          | **The durable cursor**: the next time it is due to fire.  |
+
+The loop is deliberately simple: **once a minute** the scheduler asks Postgres for
+the enabled schedules whose `next_run_at` has passed, and fires each one. Cron
+parsing uses [`robfig/cron`](https://github.com/robfig/cron)'s `ParseStandard`, so
+the `@every 30s` / `@daily` shorthands work too. Because the tick is one minute, a
+schedule fires up to ~1 minute after its due time — fine for minute-resolution
+cron, and the latency knob (`tickInterval`) is one constant.
+
+The seed migration adds one schedule — an `echo` job **every minute** — so you can
+watch it fire the moment the scheduler starts.
+
+### Firing one schedule: order is everything
+
+For each due schedule the scheduler does, in this exact order:
+
+1. **Compute** the next run time from the cron expression.
+2. **Claim** the run: advance the cursor (`last_run_at`, `next_run_at`) in Postgres
+   with a *compare-and-swap* — `UPDATE … WHERE next_run_at = <the value we just
+   read>`.
+3. **Enqueue** the job — only if the claim won — via the same persist-before-
+   enqueue path the API uses.
+
+### Why this prevents double-runs on restart
+
+A schedule's state lives entirely in Postgres (`next_run_at`), never in the
+scheduler's memory. A restarted — or replacement — scheduler just re-reads
+`next_run_at` and continues; there are no in-memory timers to lose.
+
+The **claim-before-enqueue** ordering is what makes a crash safe. The durable
+cursor moves into the future *before* the job is enqueued, so if the process dies
+anywhere after step 2, the restarted scheduler sees `next_run_at` already in the
+future and **skips** the schedule — no re-fire. The trade-off is the opposite,
+gentler failure: a crash in the small window *between* the claim and the enqueue
+loses that one run (it is never enqueued). For a recurring job that's the right
+call — a missed tick self-heals next minute, whereas a double-fire could send a
+duplicate email or double-charge. The design is **at-most-once**, chosen over
+at-least-once on purpose.
+
+(Runs missed during downtime are not replayed once per missed minute, either:
+`Next(now)` is computed from the current time, so a catch-up collapses to a single
+fire — standard cron behaviour, no backfill storm.)
+
+### What changes for multiple instances
+
+You can run several schedulers for high availability, and the **same
+compare-and-swap is what makes that safe** — no leader election required. When two
+schedulers both see the same due row, both run step 2 with the same expected
+`next_run_at`. Postgres serializes the two `UPDATE`s, so exactly one matches a row
+(and goes on to enqueue) while the other matches zero rows (and skips). You get one
+job per fire, not one per scheduler.
+
+What you'd add for a larger fleet is polish, not correctness:
+
+- a small **random jitter** on the tick so instances don't all wake on the same
+  second and pile up identical, mostly-losing `UPDATE`s;
+- if you need **at-least-once** instead, do the claim and the job's `INSERT` in one
+  Postgres transaction and push to Redis only after it commits, closing the
+  "claimed but not enqueued" window.
+
+### Watch it fire
+
+With infra up and migrations applied, run the scheduler (and a worker to execute
+what it produces):
+
+```bash
+go run ./cmd/scheduler
+# scheduler started; checking schedules every 1m0s
+# schedule 00000000-…-000000000001 fired: enqueued echo job <id> (next run …)
+```
+
+```bash
+# the schedule's cursor advanced to the next minute and last_run_at is set:
+psql "$DATABASE_URL" -c "SELECT job_type, last_run_at, next_run_at FROM job_schedules;"
+
+# a fresh echo job is produced each minute:
+psql "$DATABASE_URL" -c "SELECT id, job_type, status FROM jobs ORDER BY created_at DESC LIMIT 5;"
+```
+
+**Restart-safety in one move:** stop the scheduler and start it again within the
+same minute — it will *not* re-fire the schedule, because `next_run_at` is already
+in the future. (No `psql` on the host? Use `docker exec <postgres-container> psql
+-U dispatch -d dispatch -c '…'`.)
+
 ## Project layout
 
 ```
@@ -249,12 +381,13 @@ cmd/
   api/         HTTP API; also runs migrations via `go run ./cmd/api migrate`
   worker/      Redis consumer: runs handlers, records results, retries/dead-letters
                failures, and polls the delayed set for due retries
-  scheduler/   placeholder for delayed/retry scheduling (later step)
+  scheduler/   wakes every minute; fires due recurring schedules from job_schedules
 internal/
   config/      env-var configuration loader
-  models/      domain types (Job, Status)
-  store/       Postgres persistence + migration runner
+  models/      domain types (Job, Status, JobSchedule)
+  store/       Postgres persistence + migration runner (jobs, DLQ, schedules)
   queue/       Redis-backed work queue (LPUSH / BRPOP + delayed set)
+  enqueue/     shared persist-before-enqueue path used by the API and scheduler
   handlers/    HTTP handlers, routing, JSON responses
   jobs/        job_type -> handler registry and the built-in job handlers
 migrations/    SQL migrations (embedded into the binary)
@@ -264,5 +397,4 @@ docker-compose.yml
 
 ## Roadmap
 
-See the status checklist in `CLAUDE.md`. Next up: the scheduler, full stats, and
-the dashboard.
+See the status checklist in `CLAUDE.md`. Next up: full stats and the dashboard.
