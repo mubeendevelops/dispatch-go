@@ -152,51 +152,72 @@ func (q *Queue) Remove(ctx context.Context, queueName, jobID string) error {
 
 // --- Worker liveness (heartbeats) --------------------------------------------
 //
-// Workers don't hold a connection we can count, so each one periodically records
-// a heartbeat: a member in the "dispatch:workers" sorted set scored by the Unix
-// time it was last seen. "Active workers" is then a range count of members seen
-// within WorkerTTL. A crashed worker ages out (and is pruned on read), so it
-// disappears from the count with no explicit cleanup needed.
+// Workers don't hold a connection we can count, so each one periodically writes a
+// heartbeat key -- "dispatch:worker:<id>" -- with a short TTL. While the worker
+// runs it refreshes the key (resetting the TTL) every HeartbeatInterval; if it
+// crashes, the key simply EXPIRES after WorkerTTL and Redis removes it for us, so
+// there's no scavenger process or manual pruning to write. "Active workers" is
+// then just the number of these keys that currently exist.
+//
+// (This replaces an earlier sorted-set-of-last-seen-times scheme. Letting Redis
+// key expiry do the cleanup is simpler and removes the "prune stale members"
+// step -- the trade-off is we no longer keep each worker's last-seen timestamp,
+// which we weren't using for anything.)
 
-const workersKey = "dispatch:workers"
+const workerKeyPrefix = "dispatch:worker:"
 
-// HeartbeatInterval is how often a worker should refresh its heartbeat. WorkerTTL
-// is how long after its last beat a worker still counts as active; it is
-// comfortably larger than HeartbeatInterval so one missed beat (a GC pause, a
-// brief Redis blip) doesn't drop a healthy worker from the count.
+// HeartbeatInterval is how often a worker refreshes its heartbeat key. WorkerTTL
+// is the key's lifetime -- how long after its last beat a worker still counts as
+// active. WorkerTTL is comfortably larger than HeartbeatInterval so one missed
+// beat (a GC pause, a brief Redis blip) doesn't expire a healthy worker.
 const (
 	HeartbeatInterval = 10 * time.Second
 	WorkerTTL         = 30 * time.Second
 )
 
-// Heartbeat records that workerID is alive as of now.
+// Heartbeat records that workerID is alive: it (re)sets the worker's key with a
+// fresh WorkerTTL. Refreshing on each beat is what keeps a live worker counted;
+// once the worker stops beating the key lapses within WorkerTTL.
 func (q *Queue) Heartbeat(ctx context.Context, workerID string) error {
-	z := redis.Z{Score: float64(time.Now().Unix()), Member: workerID}
-	if err := q.rdb.ZAdd(ctx, workersKey, z).Err(); err != nil {
+	if err := q.rdb.Set(ctx, workerKeyPrefix+workerID, time.Now().Unix(), WorkerTTL).Err(); err != nil {
 		return fmt.Errorf("worker heartbeat: %w", err)
 	}
 	return nil
 }
 
-// RemoveWorker deregisters a worker immediately (called on clean shutdown so a
-// stopped worker drops out of the count at once rather than ageing out).
+// RemoveWorker deletes a worker's heartbeat key immediately, so a cleanly
+// stopped worker drops out of the count at once instead of waiting out its TTL.
 func (q *Queue) RemoveWorker(ctx context.Context, workerID string) error {
-	if err := q.rdb.ZRem(ctx, workersKey, workerID).Err(); err != nil {
+	if err := q.rdb.Del(ctx, workerKeyPrefix+workerID).Err(); err != nil {
 		return fmt.Errorf("remove worker: %w", err)
 	}
 	return nil
 }
 
-// CountActiveWorkers returns how many workers have beaten within staleAfter. It
-// first prunes members older than the cutoff so the set can't grow unbounded with
-// long-dead workers; pruning is best-effort, and the count below excludes stale
-// members regardless.
-func (q *Queue) CountActiveWorkers(ctx context.Context, staleAfter time.Duration) (int64, error) {
-	cutoff := time.Now().Add(-staleAfter).Unix()
-	q.rdb.ZRemRangeByScore(ctx, workersKey, "-inf", fmt.Sprintf("(%d", cutoff))
-	n, err := q.rdb.ZCount(ctx, workersKey, fmt.Sprintf("%d", cutoff), "+inf").Result()
-	if err != nil {
-		return 0, fmt.Errorf("count active workers: %w", err)
+// CountActiveWorkers returns how many worker heartbeat keys currently exist
+// (expired ones are already gone, so the count is self-cleaning).
+//
+// We SCAN for the keys rather than use KEYS: KEYS walks the whole keyspace in one
+// blocking pass -- fine in a test, a latency spike on a shared production Redis --
+// whereas SCAN returns them incrementally via a cursor without blocking the
+// server. SCAN may return the same key more than once across iterations (e.g.
+// during a rehash), so we collect into a set and count distinct keys rather than
+// summing batch sizes.
+func (q *Queue) CountActiveWorkers(ctx context.Context) (int64, error) {
+	seen := make(map[string]struct{})
+	var cursor uint64
+	for {
+		keys, next, err := q.rdb.Scan(ctx, cursor, workerKeyPrefix+"*", 100).Result()
+		if err != nil {
+			return 0, fmt.Errorf("count active workers: %w", err)
+		}
+		for _, k := range keys {
+			seen[k] = struct{}{}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
 	}
-	return n, nil
+	return int64(len(seen)), nil
 }

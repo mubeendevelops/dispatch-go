@@ -22,6 +22,7 @@ import (
 
 	"github.com/mubeendevelops/dispatch-go/internal/config"
 	"github.com/mubeendevelops/dispatch-go/internal/handlers"
+	"github.com/mubeendevelops/dispatch-go/internal/metrics"
 	"github.com/mubeendevelops/dispatch-go/internal/queue"
 	"github.com/mubeendevelops/dispatch-go/internal/store"
 	"github.com/mubeendevelops/dispatch-go/migrations"
@@ -82,9 +83,18 @@ func runServer(cfg config.Config) error {
 	r.Use(handlers.CORS(cfg.CORSAllowedOrigin)) // allow the dashboard origin + answer CORS preflight
 	r.Mount("/", handlers.New(st, q, cfg.Queues).Routes())
 
+	// Serve Prometheus /metrics from an outer mux so scrapes bypass the chi
+	// middleware chain -- no CORS headers or per-request access logs on a target
+	// Prometheus hits every few seconds. The gauges (job_queue_depth,
+	// workers_active) are read from Redis at scrape time via metricsSource.
+	src := metricsSource{q: q, st: st, configured: cfg.Queues}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", metrics.NewAPIHandler(src))
+	mux.Handle("/", r)
+
 	srv := &http.Server{
 		Addr:         ":" + cfg.APIPort,
-		Handler:      r,
+		Handler:      mux,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -103,7 +113,7 @@ func runServer(cfg config.Config) error {
 		shutdownErr <- srv.Shutdown(ctx)
 	}()
 
-	log.Printf("api listening on :%s", cfg.APIPort)
+	log.Printf("api listening on :%s (Prometheus metrics at /metrics)", cfg.APIPort)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

@@ -242,9 +242,12 @@ curl http://localhost:8080/api/v1/admin/stats
 - **processing_rate_per_min** — jobs completed in the last minute.
 - **avg_latency_ms** — average `completed_at − started_at` over the last hour.
 - **failure_rate** — `failed / (failed + completed)` over the last hour (0–1).
-- **active_workers** — workers that heartbeated within 30s. Each worker writes a
-  heartbeat to a Redis sorted set every 10s and deregisters on clean shutdown; a
-  crashed worker simply ages out of the count.
+- **active_workers** — live workers, derived from heartbeats. Each worker writes a
+  Redis key `dispatch:worker:<id>` with a 30s TTL and refreshes it every 10s; the
+  count is how many such keys currently exist. A crashed worker's key simply
+  expires (no pruning needed); a cleanly stopped one deletes its key at once. This
+  is the same number exported as the `workers_active` Prometheus gauge — see
+  [Observability](#observability-prometheus-metrics).
 
 ### Admin: dashboard
 
@@ -263,6 +266,86 @@ curl http://localhost:8080/api/v1/admin/dashboard
 `totals_by_status` always carries every status key (zero if none) so the frontend
 can rely on the shape, `jobs_today` counts jobs created since the start of the
 server's day, and `recent_jobs` is the 10 newest jobs.
+
+## Observability (Prometheus metrics)
+
+Both the **api** and the **worker** export Prometheus metrics in the text format
+at `GET /metrics`:
+
+| Endpoint                          | Metrics it exports                       |
+| --------------------------------- | ---------------------------------------- |
+| api — `http://localhost:8080/metrics`    | `job_queue_depth`, `workers_active`      |
+| worker — `http://localhost:9091/metrics` | `job_latency_seconds`, `jobs_processed_total` |
+
+(Both also export the standard `go_*` / `process_*` collectors. The worker's port
+is `WORKER_METRICS_ADDR`, default `:9091`.)
+
+### Why two endpoints, not one
+
+Prometheus is **pull-based**: it scrapes one `/metrics` target per process, and a
+counter or histogram only exists in the memory of the process that increments it.
+The worker is what actually runs jobs, so `job_latency_seconds` and
+`jobs_processed_total` are recorded *in the worker* and must be exposed there. The
+api never runs a job, so it can't produce those — and you can't fake them from
+Postgres at scrape time: a histogram can't be reconstructed from rows, and a
+counter derived from a `COUNT(*)` would run **backwards** the moment `/retry`
+flips a `failed` job back to `pending` (a counter going down makes `rate()`
+read it as a reset and report a false spike). So the worker owns the in-process
+metrics; the api owns the gauges it can read live from Redis.
+
+### The metrics, and where each is recorded
+
+| Metric                 | Type      | Labels     | Recorded… |
+| ---------------------- | --------- | ---------- | --------- |
+| `job_queue_depth`      | gauge     | `queue`    | **api**, at scrape time — a custom collector reads each queue's Redis work-list length (`LLEN`) when Prometheus scrapes. |
+| `workers_active`       | gauge     | —          | **api**, at scrape time — counts the live `dispatch:worker:*` heartbeat keys (`SCAN`). |
+| `job_latency_seconds`  | histogram | `job_type` | **worker**, in `process()` — wall-clock around the handler dispatch, observed for every attempt (success or failure). |
+| `jobs_processed_total` | counter   | `status`   | **worker** — incremented once a job reaches a *terminal* state: `completed` after it's saved to Postgres, `failed` after it's dead-lettered. A scheduled retry is **not** counted (the job hasn't finished). |
+
+In the worker lifecycle: a job is `BRPOP`'d → claimed (`pending→processing`) →
+its handler runs (**`job_latency_seconds` observed here**, around the dispatch) →
+on success it's marked completed (**`jobs_processed_total{status="completed"}`++**)
+or on a final failure it's dead-lettered (**`jobs_processed_total{status="failed"}`++**);
+a retry re-enqueues without touching the counter. Separately, the heartbeat
+goroutine keeps this worker's TTL key fresh, which is what the api's
+`workers_active` gauge counts. The api's `job_queue_depth` isn't produced by the
+worker at all — it's read straight from Redis when Prometheus scrapes the api.
+
+### Scrape it
+
+The two endpoints work on their own:
+
+```bash
+curl -s http://localhost:8080/metrics | grep -E '^(job_queue_depth|workers_active)'
+curl -s http://localhost:9091/metrics | grep -E '^(job_latency_seconds|jobs_processed_total)'
+```
+
+```text
+# api  (after enqueuing a few jobs and running a worker)
+job_queue_depth{queue="default"} 0
+workers_active 1
+
+# worker  (after some jobs have run)
+jobs_processed_total{status="completed"} 3
+jobs_processed_total{status="failed"} 1
+job_latency_seconds_bucket{job_type="echo",le="0.005"} 3
+job_latency_seconds_count{job_type="echo"} 3
+...
+```
+
+A ready-to-run Prometheus is wired into `docker compose` (config in
+`deploy/prometheus.yml`), scraping both targets every 15s:
+
+```bash
+docker compose up -d prometheus     # starts Prometheus on http://localhost:9090
+# then, in the UI's expression box, try:  job_queue_depth   or   rate(jobs_processed_total[5m])
+```
+
+> **Why `host.docker.internal`?** The api and worker run on the host (`go run`),
+> not in Compose, so Prometheus (in a container) reaches them through
+> `host.docker.internal`; the compose service adds a `host-gateway` entry so that
+> name resolves on Linux. If you containerise the services onto the Compose
+> network later, point the scrape targets at their service names instead.
 
 ## Job types
 
@@ -487,11 +570,13 @@ internal/
   config/      env-var configuration loader
   models/      domain types (Job, Status, JobSchedule)
   store/       Postgres persistence + migration runner (jobs, DLQ, schedules)
-  queue/       Redis-backed work queue (LPUSH / BRPOP + delayed set)
+  queue/       Redis-backed work queue (LPUSH / BRPOP + delayed set + heartbeats)
   enqueue/     shared persist-before-enqueue path used by the API and scheduler
   handlers/    HTTP API: routing, jobs + admin/stats endpoints, validation, CORS
   jobs/        job_type -> handler registry and the built-in job handlers
+  metrics/     Prometheus instrumentation (worker job metrics + api Redis gauges)
 migrations/    SQL migrations (embedded into the binary)
+deploy/        deployment config (prometheus.yml scrape targets)
 frontend/      Next.js dashboard (later step)
 docker-compose.yml
 ```

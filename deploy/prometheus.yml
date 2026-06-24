@@ -1,0 +1,25 @@
+# Prometheus scrape config for DispatchGo.
+#
+# The api and worker each expose their OWN /metrics endpoint, because Prometheus
+# pulls one target per process and a counter/histogram only exists in the process
+# that records it:
+#   - dispatch-api    -> job_queue_depth, workers_active  (read from Redis at scrape)
+#   - dispatch-worker -> job_latency_seconds, jobs_processed_total  (recorded as jobs run)
+#
+# During local dev those two processes run on the HOST (go run ./cmd/...), not in
+# Compose, so we scrape them via host.docker.internal. The prometheus service in
+# docker-compose.yml adds a host-gateway entry so that name resolves on Linux too.
+# If you instead run the api/worker in containers on this Compose network, swap
+# the targets for their service names (e.g. "api:8080", "worker:9091").
+
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: dispatch-api
+    static_configs:
+      - targets: ["host.docker.internal:8080"]
+
+  - job_name: dispatch-worker
+    static_configs:
+      - targets: ["host.docker.internal:9091"]

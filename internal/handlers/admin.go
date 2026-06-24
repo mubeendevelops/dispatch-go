@@ -6,7 +6,6 @@ import (
 	"sort"
 
 	"github.com/mubeendevelops/dispatch-go/internal/models"
-	"github.com/mubeendevelops/dispatch-go/internal/queue"
 	"github.com/mubeendevelops/dispatch-go/internal/store"
 )
 
@@ -69,7 +68,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to load metrics")
 		return
 	}
-	workers, err := h.queue.CountActiveWorkers(ctx, queue.WorkerTTL)
+	workers, err := h.queue.CountActiveWorkers(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to count workers")
 		return

@@ -34,6 +34,22 @@ services:
       timeout: 5s
       retries: 5
 
+  # Optional: Prometheus, scraping the api + worker /metrics endpoints. The Go
+  # services run on the host, so Prometheus reaches them via host.docker.internal;
+  # the host-gateway entry makes that name resolve on Linux too. Open the UI at
+  # http://localhost:9090 (try the expression `job_queue_depth`). Scrape targets
+  # live in deploy/prometheus.yml.
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - dispatch_promdata:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
 volumes:
   dispatch_pgdata:
   dispatch_redisdata:
+  dispatch_promdata:

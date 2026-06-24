@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/mubeendevelops/dispatch-go/internal/config"
 	"github.com/mubeendevelops/dispatch-go/internal/jobs"
+	"github.com/mubeendevelops/dispatch-go/internal/metrics"
 	"github.com/mubeendevelops/dispatch-go/internal/models"
 	"github.com/mubeendevelops/dispatch-go/internal/queue"
 	"github.com/mubeendevelops/dispatch-go/internal/store"
@@ -78,24 +80,29 @@ func main() {
 	// admin stats endpoint counts as "active workers".
 	workerID := uuid.NewString()
 
+	// Prometheus metrics for this worker: job_latency_seconds + jobs_processed_total,
+	// recorded in process()/handleFailure() below and exposed on its own /metrics.
+	m := metrics.NewWorker()
+
 	log.Printf("worker %s watching queues %v", workerID, cfg.Queues)
 	log.Printf("registered job types: %v", registry.Types())
 
-	// Run the consume loop, the delayed-queue poller, and the heartbeat side by
-	// side; all unwind when ctx is cancelled, and wg.Wait keeps main alive until
-	// they do.
+	// Run the consume loop, the delayed-queue poller, the heartbeat, and the
+	// metrics server side by side; all unwind when ctx is cancelled, and wg.Wait
+	// keeps main alive until they do.
 	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() { defer wg.Done(); consume(ctx, st, q, registry, cfg.Queues) }()
+	wg.Add(4)
+	go func() { defer wg.Done(); consume(ctx, st, q, registry, m, cfg.Queues) }()
 	go func() { defer wg.Done(); poll(ctx, q, cfg.Queues) }()
 	go func() { defer wg.Done(); heartbeat(ctx, q, workerID) }()
+	go func() { defer wg.Done(); serveMetrics(ctx, cfg.WorkerMetricsAddr, m.Handler()) }()
 	wg.Wait()
 
 	log.Println("worker stopped")
 }
 
 // consume is the work loop: block for a job id, process it, repeat until shutdown.
-func consume(ctx context.Context, st *store.Store, q *queue.Queue, registry *jobs.Registry, queues []string) {
+func consume(ctx context.Context, st *store.Store, q *queue.Queue, registry *jobs.Registry, m *metrics.Worker, queues []string) {
 	for {
 		if ctx.Err() != nil {
 			return
@@ -115,7 +122,7 @@ func consume(ctx context.Context, st *store.Store, q *queue.Queue, registry *job
 			}
 		}
 
-		if err := process(ctx, st, q, registry, jobID); err != nil {
+		if err := process(ctx, st, q, registry, m, jobID); err != nil {
 			log.Printf("job %s (queue %s): %v", jobID, queueName, err)
 		}
 	}
@@ -151,8 +158,9 @@ func poll(ctx context.Context, q *queue.Queue, queues []string) {
 
 // process loads the job, marks it processing, dispatches it to its handler via
 // the registry, and records the outcome -- success, a scheduled retry, or
-// dead-lettering.
-func process(ctx context.Context, st *store.Store, q *queue.Queue, registry *jobs.Registry, jobID string) error {
+// dead-lettering. It is also where the worker's two job metrics are recorded:
+// job_latency_seconds (every dispatch) and jobs_processed_total (terminal only).
+func process(ctx context.Context, st *store.Store, q *queue.Queue, registry *jobs.Registry, m *metrics.Worker, jobID string) error {
 	id, err := uuid.Parse(jobID)
 	if err != nil {
 		return err // a malformed id maps to no row; nothing to do but drop it
@@ -172,14 +180,24 @@ func process(ctx context.Context, st *store.Store, q *queue.Queue, registry *job
 
 	// Dispatch by job_type through the registry. The worker knows nothing about
 	// specific types -- the registry looks up the handler, runs it, and returns
-	// the encoded result (or an error for an unknown type / handler failure).
+	// the encoded result (or an error for an unknown type / handler failure). We
+	// time just the dispatch -- the handler's own run time -- and record it for
+	// every outcome, since a failed attempt still consumed that latency.
+	start := time.Now()
 	result, handlerErr := registry.Dispatch(ctx, job.JobType, job.Payload)
+	m.ObserveLatency(job.JobType, time.Since(start))
+
 	if handlerErr != nil {
-		return handleFailure(ctx, st, q, job, handlerErr)
+		return handleFailure(ctx, st, q, m, job, handlerErr)
 	}
 
 	log.Printf("job %s completed (type=%s)", id, job.JobType)
-	return st.MarkCompleted(ctx, id, result)
+	if err := st.MarkCompleted(ctx, id, result); err != nil {
+		return err
+	}
+	// Count the job only once it's durably marked completed in Postgres.
+	m.IncProcessed(string(models.StatusCompleted))
+	return nil
 }
 
 // handleFailure applies the retry policy when a handler errors:
@@ -192,13 +210,19 @@ func process(ctx context.Context, st *store.Store, q *queue.Queue, registry *job
 // State is persisted to Postgres BEFORE the delayed re-enqueue, matching the
 // project's "persist before enqueue" rule: a crash in between leaves a
 // recoverable row, never a queued id pointing at stale state.
-func handleFailure(ctx context.Context, st *store.Store, q *queue.Queue, job *models.Job, handlerErr error) error {
+func handleFailure(ctx context.Context, st *store.Store, q *queue.Queue, m *metrics.Worker, job *models.Job, handlerErr error) error {
 	attempts := job.RetryCount + 1 // this attempt just failed
 
-	// Out of retries: dead-letter and stop.
+	// Out of retries: dead-letter and stop. This is the job's terminal failure, so
+	// it's where we count it as processed=failed. (A retry below is not terminal --
+	// the job will run again -- so it's deliberately not counted here.)
 	if attempts >= job.MaxRetries {
 		log.Printf("job %s dead-lettered after %d attempt(s): %v", job.ID, attempts, handlerErr)
-		return st.DeadLetter(ctx, job.ID, attempts, handlerErr.Error())
+		if err := st.DeadLetter(ctx, job.ID, attempts, handlerErr.Error()); err != nil {
+			return err
+		}
+		m.IncProcessed(string(models.StatusFailed))
+		return nil
 	}
 
 	// Otherwise schedule a retry after an exponential backoff.
@@ -255,5 +279,28 @@ func heartbeat(ctx context.Context, q *queue.Queue, workerID string) {
 		case <-ticker.C:
 			beat()
 		}
+	}
+}
+
+// serveMetrics runs a tiny HTTP server exposing this worker's Prometheus metrics
+// at /metrics. It's separate from the API's endpoint on purpose: Prometheus
+// scrapes one target per process, and job_latency_seconds / jobs_processed_total
+// live in THIS process's registry (they're recorded as it runs jobs). On
+// shutdown it drains via Shutdown so an in-flight scrape isn't cut off.
+func serveMetrics(ctx context.Context, addr string, h http.Handler) {
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", h)
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+
+	go func() {
+		<-ctx.Done()
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
+	}()
+
+	log.Printf("worker metrics listening on %s (GET /metrics)", addr)
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("metrics server: %v", err)
 	}
 }

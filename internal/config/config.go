@@ -19,6 +19,7 @@ type Config struct {
 	Queues        []string // queues the worker consumes from
 
 	CORSAllowedOrigin string // browser origin allowed to call the API (the dashboard)
+	WorkerMetricsAddr string // address the worker serves its Prometheus /metrics on
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -32,6 +33,7 @@ func Load() Config {
 		Queues:        getenvList("QUEUES", []string{"default"}),
 
 		CORSAllowedOrigin: getenv("CORS_ALLOWED_ORIGIN", "http://localhost:3000"),
+		WorkerMetricsAddr: getenv("WORKER_METRICS_ADDR", ":9091"),
 	}
 }
 
