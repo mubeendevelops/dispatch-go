@@ -78,8 +78,9 @@ func runServer(cfg config.Config) error {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer) // converts a handler panic into a 500 instead of crashing the process
-	r.Mount("/", handlers.New(st, q).Routes())
+	r.Use(middleware.Recoverer)                 // converts a handler panic into a 500 instead of crashing the process
+	r.Use(handlers.CORS(cfg.CORSAllowedOrigin)) // allow the dashboard origin + answer CORS preflight
+	r.Mount("/", handlers.New(st, q, cfg.Queues).Routes())
 
 	srv := &http.Server{
 		Addr:         ":" + cfg.APIPort,

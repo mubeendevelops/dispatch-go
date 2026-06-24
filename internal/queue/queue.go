@@ -133,3 +133,70 @@ func (q *Queue) PromoteDue(ctx context.Context, queueName string, now time.Time,
 func (q *Queue) DelayedLen(ctx context.Context, queueName string) (int64, error) {
 	return q.rdb.ZCard(ctx, delayedKeyPrefix+queueName).Result()
 }
+
+// --- Job cancellation cleanup ------------------------------------------------
+
+// Remove best-effort deletes a job id from a queue's structures: the work list
+// (LREM) and the delayed set (ZREM). Cancellation calls this so a cancelled id
+// doesn't linger and skew queue-depth stats. It is best-effort -- the real guard
+// against running a cancelled job is the worker's atomic claim (store.ClaimJob).
+func (q *Queue) Remove(ctx context.Context, queueName, jobID string) error {
+	if err := q.rdb.LRem(ctx, keyPrefix+queueName, 0, jobID).Err(); err != nil {
+		return fmt.Errorf("lrem %q: %w", queueName, err)
+	}
+	if err := q.rdb.ZRem(ctx, delayedKeyPrefix+queueName, jobID).Err(); err != nil {
+		return fmt.Errorf("zrem %q: %w", queueName, err)
+	}
+	return nil
+}
+
+// --- Worker liveness (heartbeats) --------------------------------------------
+//
+// Workers don't hold a connection we can count, so each one periodically records
+// a heartbeat: a member in the "dispatch:workers" sorted set scored by the Unix
+// time it was last seen. "Active workers" is then a range count of members seen
+// within WorkerTTL. A crashed worker ages out (and is pruned on read), so it
+// disappears from the count with no explicit cleanup needed.
+
+const workersKey = "dispatch:workers"
+
+// HeartbeatInterval is how often a worker should refresh its heartbeat. WorkerTTL
+// is how long after its last beat a worker still counts as active; it is
+// comfortably larger than HeartbeatInterval so one missed beat (a GC pause, a
+// brief Redis blip) doesn't drop a healthy worker from the count.
+const (
+	HeartbeatInterval = 10 * time.Second
+	WorkerTTL         = 30 * time.Second
+)
+
+// Heartbeat records that workerID is alive as of now.
+func (q *Queue) Heartbeat(ctx context.Context, workerID string) error {
+	z := redis.Z{Score: float64(time.Now().Unix()), Member: workerID}
+	if err := q.rdb.ZAdd(ctx, workersKey, z).Err(); err != nil {
+		return fmt.Errorf("worker heartbeat: %w", err)
+	}
+	return nil
+}
+
+// RemoveWorker deregisters a worker immediately (called on clean shutdown so a
+// stopped worker drops out of the count at once rather than ageing out).
+func (q *Queue) RemoveWorker(ctx context.Context, workerID string) error {
+	if err := q.rdb.ZRem(ctx, workersKey, workerID).Err(); err != nil {
+		return fmt.Errorf("remove worker: %w", err)
+	}
+	return nil
+}
+
+// CountActiveWorkers returns how many workers have beaten within staleAfter. It
+// first prunes members older than the cutoff so the set can't grow unbounded with
+// long-dead workers; pruning is best-effort, and the count below excludes stale
+// members regardless.
+func (q *Queue) CountActiveWorkers(ctx context.Context, staleAfter time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-staleAfter).Unix()
+	q.rdb.ZRemRangeByScore(ctx, workersKey, "-inf", fmt.Sprintf("(%d", cutoff))
+	n, err := q.rdb.ZCount(ctx, workersKey, fmt.Sprintf("%d", cutoff), "+inf").Result()
+	if err != nil {
+		return 0, fmt.Errorf("count active workers: %w", err)
+	}
+	return n, nil
+}

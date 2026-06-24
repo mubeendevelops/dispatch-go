@@ -129,13 +129,22 @@ scheduler to watch scheduled echoes complete.
 
 ## API
 
-| Method | Path                        | Description                                  |
-| ------ | --------------------------- | -------------------------------------------- |
-| GET    | `/healthz`                  | Liveness + Postgres/Redis checks             |
-| POST   | `/api/v1/jobs/enqueue`      | Persist + enqueue a job; returns it (202)    |
-| GET    | `/api/v1/jobs/{id}`         | Fetch a job by id                            |
+| Method | Path                         | Description                                          |
+| ------ | ---------------------------- | ---------------------------------------------------- |
+| GET    | `/healthz`                   | Liveness + Postgres/Redis checks                     |
+| GET    | `/api/v1/jobs`               | List jobs (filter by queue/status, paginated)        |
+| POST   | `/api/v1/jobs/enqueue`       | Persist + enqueue a job; returns it (202)            |
+| GET    | `/api/v1/jobs/{id}`          | Fetch a job by id                                    |
+| POST   | `/api/v1/jobs/{id}/retry`    | Reset a failed job to pending and re-enqueue it      |
+| POST   | `/api/v1/jobs/{id}/cancel`   | Cancel a pending job                                 |
+| GET    | `/api/v1/admin/stats`        | Queue depths, throughput, latency, failures, workers |
+| GET    | `/api/v1/admin/dashboard`    | Totals by status, jobs today, recent jobs            |
 
-All error responses share one shape: `{"error": "message"}`.
+Every response is JSON. Errors all share one shape — `{"error": "message"}` — with
+the matching status code: `400` validation, `404` not found, `409` conflict (wrong
+state), `5xx` server. The API also sends CORS headers for the dashboard origin
+(`CORS_ALLOWED_ORIGIN`, default `http://localhost:3000`) and answers preflight
+`OPTIONS` requests.
 
 ### Enqueue a job
 
@@ -162,6 +171,98 @@ curl http://localhost:8080/api/v1/jobs/<job_id>
 Once a worker has processed it, `status` becomes `completed` and `result` holds
 the handler output. Which handler runs is chosen by `job_type` via a registry —
 see [Job types](#job-types).
+
+### List jobs
+
+```bash
+curl "http://localhost:8080/api/v1/jobs?status=completed&queue=default&limit=20&offset=0"
+```
+
+All query params are optional: `queue`, `status` (one of `pending`, `processing`,
+`completed`, `failed`, `cancelled`), `limit` (1–100, default 20), `offset`
+(default 0). The response is a page of jobs (newest first) plus the total match
+count for pagination:
+
+```json
+{
+  "jobs": [ { "id": "…", "status": "completed", "...": "..." } ],
+  "total": 42,
+  "limit": 20,
+  "offset": 0
+}
+```
+
+Invalid params return `400` — e.g. an unknown `status`, or `limit` out of range.
+
+### Retry a failed job
+
+```bash
+curl -X POST http://localhost:8080/api/v1/jobs/<job_id>/retry
+```
+
+Resets a **failed** job back to `pending` (clears `retry_count`, the error, and
+the result) and deletes its dead-letter row in one transaction, then re-enqueues
+it (persist-before-enqueue). Returns the reset job (`200`). Only failed jobs are
+retryable: a pending/processing/completed job returns `409`; an unknown id `404`.
+
+### Cancel a pending job
+
+```bash
+curl -X POST http://localhost:8080/api/v1/jobs/<job_id>/cancel
+```
+
+Marks a **pending** job `cancelled` so it never runs, and drops its id from Redis.
+Only pending jobs can be cancelled — one already `processing` is in flight and is
+not preempted (`409`). Returns the cancelled job (`200`).
+
+> **Why cancellation is race-proof.** Flipping the row to `cancelled` isn't enough
+> on its own — a worker may already have popped the id. So the worker *claims* each
+> job with an atomic `UPDATE … WHERE status = 'pending'` (`store.ClaimJob`); a job
+> that was cancelled (or already taken) updates no row and is skipped. Removing the
+> id from Redis is just best-effort cleanup so queue depth stays accurate.
+
+### Admin: stats
+
+```bash
+curl http://localhost:8080/api/v1/admin/stats
+```
+
+```json
+{
+  "queues": [ { "queue": "default", "depth": 0, "delayed": 0 } ],
+  "processing_rate_per_min": 3,
+  "avg_latency_ms": 1.53,
+  "failure_rate": 0.25,
+  "active_workers": 1
+}
+```
+
+- **queues** — per-queue backlog: `depth` is the Redis work-list length, `delayed`
+  the retry-backoff set length. Covers configured queues plus any seen in the DB.
+- **processing_rate_per_min** — jobs completed in the last minute.
+- **avg_latency_ms** — average `completed_at − started_at` over the last hour.
+- **failure_rate** — `failed / (failed + completed)` over the last hour (0–1).
+- **active_workers** — workers that heartbeated within 30s. Each worker writes a
+  heartbeat to a Redis sorted set every 10s and deregisters on clean shutdown; a
+  crashed worker simply ages out of the count.
+
+### Admin: dashboard
+
+```bash
+curl http://localhost:8080/api/v1/admin/dashboard
+```
+
+```json
+{
+  "totals_by_status": { "pending": 0, "processing": 0, "completed": 3, "failed": 1, "cancelled": 1 },
+  "jobs_today": 5,
+  "recent_jobs": [ { "id": "…", "...": "..." } ]
+}
+```
+
+`totals_by_status` always carries every status key (zero if none) so the frontend
+can rely on the shape, `jobs_today` counts jobs created since the start of the
+server's day, and `recent_jobs` is the 10 newest jobs.
 
 ## Job types
 
@@ -388,7 +489,7 @@ internal/
   store/       Postgres persistence + migration runner (jobs, DLQ, schedules)
   queue/       Redis-backed work queue (LPUSH / BRPOP + delayed set)
   enqueue/     shared persist-before-enqueue path used by the API and scheduler
-  handlers/    HTTP handlers, routing, JSON responses
+  handlers/    HTTP API: routing, jobs + admin/stats endpoints, validation, CORS
   jobs/        job_type -> handler registry and the built-in job handlers
 migrations/    SQL migrations (embedded into the binary)
 frontend/      Next.js dashboard (later step)
@@ -397,4 +498,4 @@ docker-compose.yml
 
 ## Roadmap
 
-See the status checklist in `CLAUDE.md`. Next up: full stats and the dashboard.
+See the status checklist in `CLAUDE.md`. Next up: the frontend dashboard.

@@ -17,6 +17,8 @@ type Config struct {
 	RedisDB       int      // Redis logical database number
 	APIPort       string   // port the HTTP API listens on
 	Queues        []string // queues the worker consumes from
+
+	CORSAllowedOrigin string // browser origin allowed to call the API (the dashboard)
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -28,6 +30,8 @@ func Load() Config {
 		RedisDB:       getenvInt("REDIS_DB", 0),
 		APIPort:       getenv("API_PORT", "8080"),
 		Queues:        getenvList("QUEUES", []string{"default"}),
+
+		CORSAllowedOrigin: getenv("CORS_ALLOWED_ORIGIN", "http://localhost:3000"),
 	}
 }
 

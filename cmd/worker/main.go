@@ -74,15 +74,21 @@ func main() {
 	// jobs.DefaultRegistry; the worker below stays generic.
 	registry := jobs.DefaultRegistry()
 
-	log.Printf("worker watching queues %v", cfg.Queues)
+	// A stable id for this worker process, used for the liveness heartbeats the
+	// admin stats endpoint counts as "active workers".
+	workerID := uuid.NewString()
+
+	log.Printf("worker %s watching queues %v", workerID, cfg.Queues)
 	log.Printf("registered job types: %v", registry.Types())
 
-	// Run the consume loop and the delayed-queue poller side by side; both unwind
-	// when ctx is cancelled, and wg.Wait keeps main alive until they do.
+	// Run the consume loop, the delayed-queue poller, and the heartbeat side by
+	// side; all unwind when ctx is cancelled, and wg.Wait keeps main alive until
+	// they do.
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() { defer wg.Done(); consume(ctx, st, q, registry, cfg.Queues) }()
 	go func() { defer wg.Done(); poll(ctx, q, cfg.Queues) }()
+	go func() { defer wg.Done(); heartbeat(ctx, q, workerID) }()
 	wg.Wait()
 
 	log.Println("worker stopped")
@@ -152,16 +158,19 @@ func process(ctx context.Context, st *store.Store, q *queue.Queue, registry *job
 		return err // a malformed id maps to no row; nothing to do but drop it
 	}
 
-	job, err := st.GetJob(ctx, id)
+	// Claim the job: flip pending -> processing atomically and load it in one shot.
+	// A non-pending job (cancelled via the API, or already taken) yields
+	// ErrJobNotClaimable and is skipped -- this is what makes POST /cancel stick.
+	job, err := st.ClaimJob(ctx, id)
 	if err != nil {
-		return err
-	}
-	if err := st.MarkProcessing(ctx, id); err != nil {
+		if errors.Is(err, store.ErrJobNotClaimable) {
+			log.Printf("job %s skipped (cancelled or already claimed)", id)
+			return nil
+		}
 		return err
 	}
 
-	// Dispatch by job_type through the registry. Before this refactor the worker
-	// ran a hardcoded switch on job.JobType here; now it knows nothing about
+	// Dispatch by job_type through the registry. The worker knows nothing about
 	// specific types -- the registry looks up the handler, runs it, and returns
 	// the encoded result (or an error for an unknown type / handler failure).
 	result, handlerErr := registry.Dispatch(ctx, job.JobType, job.Payload)
@@ -215,4 +224,36 @@ func backoffFor(attempt int) time.Duration {
 		return d
 	}
 	return maxBackoff
+}
+
+// heartbeat registers this worker's liveness in Redis on a fixed interval so the
+// admin stats endpoint can report an "active workers" count. We write an initial
+// beat immediately (so the worker appears without waiting a full interval) and
+// deregister on shutdown so a cleanly stopped worker drops out of the count at
+// once rather than ageing out.
+func heartbeat(ctx context.Context, q *queue.Queue, workerID string) {
+	beat := func() {
+		if err := q.Heartbeat(ctx, workerID); err != nil && ctx.Err() == nil {
+			log.Printf("heartbeat: %v", err)
+		}
+	}
+	beat()
+
+	ticker := time.NewTicker(queue.HeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			// ctx is already cancelled, so use a fresh short-lived context to
+			// deregister before we exit.
+			rmCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if err := q.RemoveWorker(rmCtx, workerID); err != nil {
+				log.Printf("deregister worker: %v", err)
+			}
+			cancel()
+			return
+		case <-ticker.C:
+			beat()
+		}
+	}
 }

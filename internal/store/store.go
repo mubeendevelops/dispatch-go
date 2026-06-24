@@ -15,8 +15,15 @@ import (
 	"github.com/mubeendevelops/dispatch-go/internal/models"
 )
 
-// ErrJobNotFound is returned by GetJob when no row matches the id.
-var ErrJobNotFound = errors.New("job not found")
+// Sentinel errors let handlers map store outcomes onto HTTP status codes without
+// knowing any SQL: ErrJobNotFound is a 404, and the "not <state>" errors are 409s
+// (the job exists but isn't in a state the operation allows).
+var (
+	ErrJobNotFound       = errors.New("job not found")
+	ErrJobNotClaimable   = errors.New("job is not pending (cannot be claimed)")
+	ErrJobNotRetryable   = errors.New("job is not failed (cannot be retried)")
+	ErrJobNotCancellable = errors.New("job is not pending (cannot be cancelled)")
+)
 
 // Store wraps a pgx connection pool. A pool (not a single conn) is safe for
 // concurrent use by the API's request handlers and the worker.
@@ -77,11 +84,25 @@ func (s *Store) GetJob(ctx context.Context, id uuid.UUID) (*models.Job, error) {
 	return &job, nil
 }
 
-// MarkProcessing transitions a job to "processing" and stamps started_at.
-func (s *Store) MarkProcessing(ctx context.Context, id uuid.UUID) error {
-	const q = `UPDATE jobs SET status = $2, started_at = now() WHERE id = $1`
-	_, err := s.pool.Exec(ctx, q, id, models.StatusProcessing)
-	return err
+// ClaimJob atomically transitions a job from pending to processing, stamps
+// started_at, and returns the claimed row -- all in one statement. The
+// WHERE status = pending guard is the point: if the job was cancelled (or already
+// claimed by another worker) it updates no row and ClaimJob returns
+// ErrJobNotClaimable, so the worker skips it instead of running it. This is what
+// makes POST /cancel effective even after the id is already sitting on the queue.
+func (s *Store) ClaimJob(ctx context.Context, id uuid.UUID) (*models.Job, error) {
+	const q = `
+		UPDATE jobs SET status = $2, started_at = now()
+		WHERE id = $1 AND status = $3
+		RETURNING ` + jobColumns
+	var job models.Job
+	if err := scanJob(s.pool.QueryRow(ctx, q, id, models.StatusProcessing, models.StatusPending), &job); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrJobNotClaimable
+		}
+		return nil, fmt.Errorf("claim job: %w", err)
+	}
+	return &job, nil
 }
 
 // MarkCompleted stores the handler result, clears any prior error, and stamps
