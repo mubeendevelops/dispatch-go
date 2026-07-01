@@ -17,20 +17,20 @@ scheduler ──cron (1/min)──▶┤  both producers persist to Postgres, TH
                                   worker  ◀┘  BRPOP id → load job → run handler → save result
 ```
 
-- **Postgres is the source of truth.** A job is persisted *before* its id is
+- **Postgres is the source of truth.** A job is persisted _before_ its id is
   pushed to Redis, so a crash between the two can only leave a recoverable row,
   never a queued id pointing at nothing.
 - **Redis carries only job IDs.** Producers `LPUSH`, workers `BRPOP` (blocking,
   so idle workers use no CPU and pick up work instantly). Push-left + pop-right = FIFO.
 - **Failures retry with backoff, then dead-letter.** A failed job is parked in a
-  per-queue Redis *sorted set* scored by its next run time; a poller promotes it
+  per-queue Redis _sorted set_ scored by its next run time; a poller promotes it
   back onto the work list once due. After it exhausts its retries it's marked
   `failed` and recorded in the `dead_letter_queue` table. See
   [Retries & the dead-letter queue](#retries--the-dead-letter-queue).
 - **Recurring jobs come from the scheduler.** `cmd/scheduler` reads cron-based
-  rows from `job_schedules` and produces jobs through the *same* persist-before-
+  rows from `job_schedules` and produces jobs through the _same_ persist-before-
   enqueue path as the API. It advances each schedule's `next_run_at` cursor in
-  Postgres *before* enqueuing — that ordering is what stops it double-firing
+  Postgres _before_ enqueuing — that ordering is what stops it double-firing
   across restarts. See [Recurring schedules](#recurring-schedules-the-scheduler).
 
 ## Stack
@@ -129,16 +129,16 @@ scheduler to watch scheduled echoes complete.
 
 ## API
 
-| Method | Path                         | Description                                          |
-| ------ | ---------------------------- | ---------------------------------------------------- |
-| GET    | `/healthz`                   | Liveness + Postgres/Redis checks                     |
-| GET    | `/api/v1/jobs`               | List jobs (filter by queue/status, paginated)        |
-| POST   | `/api/v1/jobs/enqueue`       | Persist + enqueue a job; returns it (202)            |
-| GET    | `/api/v1/jobs/{id}`          | Fetch a job by id                                    |
-| POST   | `/api/v1/jobs/{id}/retry`    | Reset a failed job to pending and re-enqueue it      |
-| POST   | `/api/v1/jobs/{id}/cancel`   | Cancel a pending job                                 |
-| GET    | `/api/v1/admin/stats`        | Queue depths, throughput, latency, failures, workers |
-| GET    | `/api/v1/admin/dashboard`    | Totals by status, jobs today, recent jobs            |
+| Method | Path                       | Description                                          |
+| ------ | -------------------------- | ---------------------------------------------------- |
+| GET    | `/healthz`                 | Liveness + Postgres/Redis checks                     |
+| GET    | `/api/v1/jobs`             | List jobs (filter by queue/status, paginated)        |
+| POST   | `/api/v1/jobs/enqueue`     | Persist + enqueue a job; returns it (202)            |
+| GET    | `/api/v1/jobs/{id}`        | Fetch a job by id                                    |
+| POST   | `/api/v1/jobs/{id}/retry`  | Reset a failed job to pending and re-enqueue it      |
+| POST   | `/api/v1/jobs/{id}/cancel` | Cancel a pending job                                 |
+| GET    | `/api/v1/admin/stats`      | Queue depths, throughput, latency, failures, workers |
+| GET    | `/api/v1/admin/dashboard`  | Totals by status, jobs today, recent jobs            |
 
 Every response is JSON. Errors all share one shape — `{"error": "message"}` — with
 the matching status code: `400` validation, `404` not found, `409` conflict (wrong
@@ -185,7 +185,7 @@ count for pagination:
 
 ```json
 {
-  "jobs": [ { "id": "…", "status": "completed", "...": "..." } ],
+  "jobs": [{ "id": "…", "status": "completed", "...": "..." }],
   "total": 42,
   "limit": 20,
   "offset": 0
@@ -216,7 +216,7 @@ Only pending jobs can be cancelled — one already `processing` is in flight and
 not preempted (`409`). Returns the cancelled job (`200`).
 
 > **Why cancellation is race-proof.** Flipping the row to `cancelled` isn't enough
-> on its own — a worker may already have popped the id. So the worker *claims* each
+> on its own — a worker may already have popped the id. So the worker _claims_ each
 > job with an atomic `UPDATE … WHERE status = 'pending'` (`store.ClaimJob`); a job
 > that was cancelled (or already taken) updates no row and is skipped. Removing the
 > id from Redis is just best-effort cleanup so queue depth stays accurate.
@@ -229,7 +229,7 @@ curl http://localhost:8080/api/v1/admin/stats
 
 ```json
 {
-  "queues": [ { "queue": "default", "depth": 0, "delayed": 0 } ],
+  "queues": [{ "queue": "default", "depth": 0, "delayed": 0 }],
   "processing_rate_per_min": 3,
   "avg_latency_ms": 1.53,
   "failure_rate": 0.25,
@@ -257,9 +257,15 @@ curl http://localhost:8080/api/v1/admin/dashboard
 
 ```json
 {
-  "totals_by_status": { "pending": 0, "processing": 0, "completed": 3, "failed": 1, "cancelled": 1 },
+  "totals_by_status": {
+    "pending": 0,
+    "processing": 0,
+    "completed": 3,
+    "failed": 1,
+    "cancelled": 1
+  },
   "jobs_today": 5,
-  "recent_jobs": [ { "id": "…", "...": "..." } ]
+  "recent_jobs": [{ "id": "…", "...": "..." }]
 }
 ```
 
@@ -272,9 +278,9 @@ server's day, and `recent_jobs` is the 10 newest jobs.
 Both the **api** and the **worker** export Prometheus metrics in the text format
 at `GET /metrics`:
 
-| Endpoint                          | Metrics it exports                       |
-| --------------------------------- | ---------------------------------------- |
-| api — `http://localhost:8080/metrics`    | `job_queue_depth`, `workers_active`      |
+| Endpoint                                 | Metrics it exports                            |
+| ---------------------------------------- | --------------------------------------------- |
+| api — `http://localhost:8080/metrics`    | `job_queue_depth`, `workers_active`           |
 | worker — `http://localhost:9091/metrics` | `job_latency_seconds`, `jobs_processed_total` |
 
 (Both also export the standard `go_*` / `process_*` collectors. The worker's port
@@ -285,7 +291,7 @@ is `WORKER_METRICS_ADDR`, default `:9091`.)
 Prometheus is **pull-based**: it scrapes one `/metrics` target per process, and a
 counter or histogram only exists in the memory of the process that increments it.
 The worker is what actually runs jobs, so `job_latency_seconds` and
-`jobs_processed_total` are recorded *in the worker* and must be exposed there. The
+`jobs_processed_total` are recorded _in the worker_ and must be exposed there. The
 api never runs a job, so it can't produce those — and you can't fake them from
 Postgres at scrape time: a histogram can't be reconstructed from rows, and a
 counter derived from a `COUNT(*)` would run **backwards** the moment `/retry`
@@ -295,12 +301,12 @@ metrics; the api owns the gauges it can read live from Redis.
 
 ### The metrics, and where each is recorded
 
-| Metric                 | Type      | Labels     | Recorded… |
-| ---------------------- | --------- | ---------- | --------- |
-| `job_queue_depth`      | gauge     | `queue`    | **api**, at scrape time — a custom collector reads each queue's Redis work-list length (`LLEN`) when Prometheus scrapes. |
-| `workers_active`       | gauge     | —          | **api**, at scrape time — counts the live `dispatch:worker:*` heartbeat keys (`SCAN`). |
-| `job_latency_seconds`  | histogram | `job_type` | **worker**, in `process()` — wall-clock around the handler dispatch, observed for every attempt (success or failure). |
-| `jobs_processed_total` | counter   | `status`   | **worker** — incremented once a job reaches a *terminal* state: `completed` after it's saved to Postgres, `failed` after it's dead-lettered. A scheduled retry is **not** counted (the job hasn't finished). |
+| Metric                 | Type      | Labels     | Recorded…                                                                                                                                                                                                    |
+| ---------------------- | --------- | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `job_queue_depth`      | gauge     | `queue`    | **api**, at scrape time — a custom collector reads each queue's Redis work-list length (`LLEN`) when Prometheus scrapes.                                                                                     |
+| `workers_active`       | gauge     | —          | **api**, at scrape time — counts the live `dispatch:worker:*` heartbeat keys (`SCAN`).                                                                                                                       |
+| `job_latency_seconds`  | histogram | `job_type` | **worker**, in `process()` — wall-clock around the handler dispatch, observed for every attempt (success or failure).                                                                                        |
+| `jobs_processed_total` | counter   | `status`   | **worker** — incremented once a job reaches a _terminal_ state: `completed` after it's saved to Postgres, `failed` after it's dead-lettered. A scheduled retry is **not** counted (the job hasn't finished). |
 
 In the worker lifecycle: a job is `BRPOP`'d → claimed (`pending→processing`) →
 its handler runs (**`job_latency_seconds` observed here**, around the dispatch) →
@@ -427,7 +433,7 @@ instantly and hammer whatever just failed. Instead:
   exactly one. This is our guard against double-promotion.
 
 Postgres stays the source of truth throughout; the sorted set only schedules
-*when* an id re-enters the queue.
+_when_ an id re-enters the queue.
 
 ### Testing it
 
@@ -468,13 +474,13 @@ redis-cli -p 6379 ZRANGE dispatch:delayed:default 0 -1 WITHSCORES
 `job_schedules` table is a **cron expression** plus a **job template**
 (`job_type` + `payload`):
 
-| Column                 | Meaning                                                   |
-| ---------------------- | --------------------------------------------------------- |
-| `cron_expression`      | When to fire — standard 5-field crontab (e.g. `* * * * *`).|
-| `job_type` + `payload` | The job to enqueue each time it fires.                    |
-| `enabled`              | Turn a schedule off without deleting it.                  |
-| `last_run_at`          | When it last fired (`NULL` until the first).              |
-| `next_run_at`          | **The durable cursor**: the next time it is due to fire.  |
+| Column                 | Meaning                                                     |
+| ---------------------- | ----------------------------------------------------------- |
+| `cron_expression`      | When to fire — standard 5-field crontab (e.g. `* * * * *`). |
+| `job_type` + `payload` | The job to enqueue each time it fires.                      |
+| `enabled`              | Turn a schedule off without deleting it.                    |
+| `last_run_at`          | When it last fired (`NULL` until the first).                |
+| `next_run_at`          | **The durable cursor**: the next time it is due to fire.    |
 
 The loop is deliberately simple: **once a minute** the scheduler asks Postgres for
 the enabled schedules whose `next_run_at` has passed, and fires each one. Cron
@@ -492,8 +498,8 @@ For each due schedule the scheduler does, in this exact order:
 
 1. **Compute** the next run time from the cron expression.
 2. **Claim** the run: advance the cursor (`last_run_at`, `next_run_at`) in Postgres
-   with a *compare-and-swap* — `UPDATE … WHERE next_run_at = <the value we just
-   read>`.
+   with a _compare-and-swap_ — `UPDATE … WHERE next_run_at = <the value we just
+read>`.
 3. **Enqueue** the job — only if the claim won — via the same persist-before-
    enqueue path the API uses.
 
@@ -504,10 +510,10 @@ scheduler's memory. A restarted — or replacement — scheduler just re-reads
 `next_run_at` and continues; there are no in-memory timers to lose.
 
 The **claim-before-enqueue** ordering is what makes a crash safe. The durable
-cursor moves into the future *before* the job is enqueued, so if the process dies
+cursor moves into the future _before_ the job is enqueued, so if the process dies
 anywhere after step 2, the restarted scheduler sees `next_run_at` already in the
 future and **skips** the schedule — no re-fire. The trade-off is the opposite,
-gentler failure: a crash in the small window *between* the claim and the enqueue
+gentler failure: a crash in the small window _between_ the claim and the enqueue
 loses that one run (it is never enqueued). For a recurring job that's the right
 call — a missed tick self-heals next minute, whereas a double-fire could send a
 duplicate email or double-charge. The design is **at-most-once**, chosen over
@@ -554,7 +560,7 @@ psql "$DATABASE_URL" -c "SELECT id, job_type, status FROM jobs ORDER BY created_
 ```
 
 **Restart-safety in one move:** stop the scheduler and start it again within the
-same minute — it will *not* re-fire the schedule, because `next_run_at` is already
+same minute — it will _not_ re-fire the schedule, because `next_run_at` is already
 in the future. (No `psql` on the host? Use `docker exec <postgres-container> psql
 -U dispatch -d dispatch -c '…'`.)
 
@@ -583,4 +589,13 @@ docker-compose.yml
 
 ## Roadmap
 
-See the status checklist in `CLAUDE.md`. Next up: the frontend dashboard.
+- [x] Foundation skeleton
+- [x] Retry + dead-letter queue
+- [x] Handler registry
+- [x] Scheduler
+- [x] Full API + stats
+- [x] Metrics + heartbeats (Prometheus /metrics on api + worker; Redis key-TTL heartbeats)
+- [ ] Frontend dashboard
+- [ ] Jobs list + detail
+- [ ] Charts + workers
+- [ ] Docker + deploy
