@@ -9,6 +9,13 @@ import (
 	"strings"
 )
 
+// DefaultSessionSecret is the stand-in SESSION_SECRET used when the env var is
+// unset, so a fresh checkout runs without a .env (matching this package's
+// defaults-mirror-compose philosophy). It is deliberately weak and public: cmd/api
+// warns when it is in use, and production MUST override it -- the secret peppers
+// session-token hashes, so a public value defeats that protection.
+const DefaultSessionSecret = "dev-insecure-change-me"
+
 // Config holds everything the services need to start.
 type Config struct {
 	DatabaseURL   string   // pgx connection string
@@ -20,6 +27,9 @@ type Config struct {
 
 	CORSAllowedOrigin string // browser origin allowed to call the API (the dashboard)
 	WorkerMetricsAddr string // address the worker serves its Prometheus /metrics on
+
+	SessionSecret       string // pepper for hashing session tokens; MUST be overridden in prod
+	SessionCookieSecure bool   // set the Secure flag on the session cookie (true behind HTTPS)
 }
 
 // Load reads configuration from the environment, applying sensible defaults.
@@ -34,6 +44,9 @@ func Load() Config {
 
 		CORSAllowedOrigin: getenv("CORS_ALLOWED_ORIGIN", "http://localhost:3000"),
 		WorkerMetricsAddr: getenv("WORKER_METRICS_ADDR", ":9091"),
+
+		SessionSecret:       getenv("SESSION_SECRET", DefaultSessionSecret),
+		SessionCookieSecure: getenvBool("SESSION_COOKIE_SECURE", false),
 	}
 }
 
@@ -48,6 +61,17 @@ func getenvInt(key string, fallback int) int {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+// getenvBool parses a boolean env var (1/t/true/0/f/false, per strconv.ParseBool),
+// falling back on an unset, empty, or unparseable value.
+func getenvBool(key string, fallback bool) bool {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return fallback

@@ -81,7 +81,18 @@ func runServer(cfg config.Config) error {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)                 // converts a handler panic into a 500 instead of crashing the process
 	r.Use(handlers.CORS(cfg.CORSAllowedOrigin)) // allow the dashboard origin + answer CORS preflight
-	r.Mount("/", handlers.New(st, q, cfg.Queues).Routes())
+
+	// Auth/session settings. Warn loudly if the pepper is still the insecure dev
+	// default -- in production a public pepper defeats the point of hashing session
+	// tokens with it.
+	if cfg.SessionSecret == config.DefaultSessionSecret {
+		log.Println("WARNING: SESSION_SECRET is the insecure dev default; set a strong SESSION_SECRET in production")
+	}
+	sessionCfg := handlers.SessionConfig{
+		Secret: []byte(cfg.SessionSecret),
+		Secure: cfg.SessionCookieSecure,
+	}
+	r.Mount("/", handlers.New(st, q, cfg.Queues, sessionCfg).Routes())
 
 	// Serve Prometheus /metrics from an outer mux so scrapes bypass the chi
 	// middleware chain -- no CORS headers or per-request access logs on a target
