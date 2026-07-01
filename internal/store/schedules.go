@@ -11,15 +11,21 @@ import (
 )
 
 // scheduleColumns is the canonical column list/order shared by job_schedules
-// reads so every SELECT scans the same way.
+// reads so every SELECT scans the same way. tenant_id travels with each schedule
+// so the scheduler can stamp the fired job with its owning tenant.
 const scheduleColumns = `
-	id, job_type, payload, cron_expression, enabled,
+	id, tenant_id, job_type, payload, cron_expression, enabled,
 	last_run_at, next_run_at, created_at`
 
 // DueSchedules returns the enabled schedules whose next_run_at is at or before
 // now -- the schedules that should fire this tick. Ordered by next_run_at so the
 // most overdue ones fire first. The partial index idx_job_schedules_due serves
 // this query.
+//
+// This is deliberately NOT tenant-scoped: like the worker, the scheduler is
+// trusted infrastructure that fires every tenant's due schedules. Each returned
+// row carries its own tenant_id, which the scheduler stamps onto the job it
+// enqueues -- so tenancy is preserved without the due-scan needing a tenant arg.
 func (s *Store) DueSchedules(ctx context.Context, now time.Time) ([]models.JobSchedule, error) {
 	const q = `
 		SELECT ` + scheduleColumns + `
@@ -36,7 +42,7 @@ func (s *Store) DueSchedules(ctx context.Context, now time.Time) ([]models.JobSc
 	for rows.Next() {
 		var sc models.JobSchedule
 		if err := rows.Scan(
-			&sc.ID, &sc.JobType, &sc.Payload, &sc.CronExpression, &sc.Enabled,
+			&sc.ID, &sc.TenantID, &sc.JobType, &sc.Payload, &sc.CronExpression, &sc.Enabled,
 			&sc.LastRunAt, &sc.NextRunAt, &sc.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan schedule: %w", err)

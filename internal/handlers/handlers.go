@@ -45,6 +45,11 @@ func (h *Handler) Routes() http.Handler {
 	r.Get("/healthz", h.health)
 
 	r.Route("/api/v1", func(r chi.Router) {
+		// Attribute every /api/v1 request to a tenant and scope the handlers below
+		// to it. Phase A uses the default-tenant bridge; Phase B swaps this for real
+		// API-key / session auth without touching the handlers.
+		r.Use(DefaultTenant)
+
 		// Jobs.
 		r.Get("/jobs", h.listJobs)
 		r.Post("/jobs/enqueue", h.enqueueJob)

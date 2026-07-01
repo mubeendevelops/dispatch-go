@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
+
 	"github.com/mubeendevelops/dispatch-go/internal/models"
 )
 
@@ -18,9 +20,10 @@ type Metrics struct {
 	AvgLatencySeconds   float64 // avg(completed_at - started_at) over the last hour; 0 if no samples
 }
 
-// JobMetrics computes all the windowed counters in a single pass over the jobs
-// table using FILTERed aggregates.
-func (s *Store) JobMetrics(ctx context.Context) (Metrics, error) {
+// JobMetrics computes all the windowed counters for one tenant in a single pass
+// over its jobs using FILTERed aggregates. These are tenant-facing dashboard
+// numbers -- distinct from the global Prometheus operator metrics.
+func (s *Store) JobMetrics(ctx context.Context, tenantID uuid.UUID) (Metrics, error) {
 	const q = `
 		SELECT
 			count(*) FILTER (WHERE status = 'completed' AND completed_at >= now() - interval '1 minute'),
@@ -31,9 +34,10 @@ func (s *Store) JobMetrics(ctx context.Context) (Metrics, error) {
 				FILTER (WHERE status = 'completed' AND completed_at >= now() - interval '1 hour'
 				        AND started_at IS NOT NULL AND completed_at IS NOT NULL),
 				0)
-		FROM jobs`
+		FROM jobs
+		WHERE tenant_id = $1`
 	var m Metrics
-	if err := s.pool.QueryRow(ctx, q).Scan(
+	if err := s.pool.QueryRow(ctx, q, tenantID).Scan(
 		&m.CompletedLastMinute, &m.CompletedLastHour, &m.FailedLastHour, &m.AvgLatencySeconds,
 	); err != nil {
 		return Metrics{}, fmt.Errorf("job metrics: %w", err)
@@ -41,16 +45,18 @@ func (s *Store) JobMetrics(ctx context.Context) (Metrics, error) {
 	return m, nil
 }
 
-// StatusCounts returns the total number of jobs in each status, plus how many
-// jobs were created today (server-local day). Both come from one grouped query.
-func (s *Store) StatusCounts(ctx context.Context) (map[models.Status]int, int, error) {
+// StatusCounts returns, for one tenant, the total number of jobs in each status,
+// plus how many were created today (server-local day). Both come from one grouped
+// query scoped by tenant_id.
+func (s *Store) StatusCounts(ctx context.Context, tenantID uuid.UUID) (map[models.Status]int, int, error) {
 	const q = `
 		SELECT status,
 		       count(*),
 		       count(*) FILTER (WHERE created_at >= date_trunc('day', now()))
 		FROM jobs
+		WHERE tenant_id = $1
 		GROUP BY status`
-	rows, err := s.pool.Query(ctx, q)
+	rows, err := s.pool.Query(ctx, q, tenantID)
 	if err != nil {
 		return nil, 0, fmt.Errorf("status counts: %w", err)
 	}

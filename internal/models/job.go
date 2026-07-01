@@ -9,6 +9,15 @@ import (
 	"github.com/google/uuid"
 )
 
+// DefaultTenantID is the tenant that owns every job created before per-request
+// tenancy exists. Migration 0011 backfills all pre-tenancy rows to it, and until
+// Phase B wires real auth (API keys / sessions) the API attributes newly enqueued
+// jobs to it -- so the external API keeps working unchanged while every job is
+// nonetheless owned. It must be non-nil: the enqueue path rejects a uuid.Nil
+// ("unowned") tenant as a bug, so there is no valid "empty" owner. Kept in sync
+// with the seed in migration 0005. (A const can't hold a uuid.UUID, hence a var.)
+var DefaultTenantID = uuid.MustParse("11111111-1111-1111-1111-111111111111")
+
 // Status is a job's lifecycle state. It is stored as TEXT in Postgres.
 type Status string
 
@@ -45,6 +54,7 @@ func (s Status) Valid() bool {
 // columns are pointers so "unset" is distinguishable from a zero value.
 type Job struct {
 	ID           uuid.UUID       `json:"id"`
+	TenantID     uuid.UUID       `json:"tenant_id"` // owning tenant; isolation is enforced on this in the store
 	QueueName    string          `json:"queue_name"`
 	JobType      string          `json:"job_type"`
 	Payload      json.RawMessage `json:"payload"`

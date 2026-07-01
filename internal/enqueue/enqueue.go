@@ -31,6 +31,12 @@ const DefaultMaxRetries = 3
 // tell this apart from a plain persist failure (where nothing was written at all).
 var ErrEnqueueAfterPersist = errors.New("job persisted but enqueue failed")
 
+// ErrMissingTenant means Submit was handed a job with no owning tenant
+// (uuid.Nil). It is the structural guard that keeps the persist-before-enqueue
+// path incapable of admitting an unowned job: in a multi-tenant system a job with
+// no tenant is a bug, not a default, so we refuse it before it can reach Postgres.
+var ErrMissingTenant = errors.New("job has no tenant")
+
 // Enqueuer persists jobs and pushes their ids onto the work queue. It wraps the
 // two lower layers so the persist-before-enqueue invariant has a single
 // implementation shared by every producer.
@@ -55,6 +61,15 @@ func New(s *store.Store, q *queue.Queue) *Enqueuer {
 // (recoverable) case distinctly.
 func (e *Enqueuer) Submit(ctx context.Context, job *models.Job) error {
 	applyDefaults(job)
+
+	// Tenant is the one field applyDefaults deliberately does NOT invent: unlike a
+	// missing queue_name (safely "default"), there is no safe default owner, so a
+	// tenantless job is rejected here rather than silently attributed to someone.
+	// This runs before CreateJob, so an unowned job never touches Postgres. (The DB
+	// NOT NULL + FK on tenant_id is the backstop; this is the clean, early guard.)
+	if job.TenantID == uuid.Nil {
+		return ErrMissingTenant
+	}
 
 	if err := e.store.CreateJob(ctx, job); err != nil {
 		return fmt.Errorf("persist job: %w", err)

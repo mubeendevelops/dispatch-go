@@ -161,10 +161,13 @@ func fireSchedule(ctx context.Context, st *store.Store, enq *enqueue.Enqueuer, n
 		return
 	}
 
-	// We own this run: enqueue a job from the schedule's template. Schedules carry
-	// no queue_name of their own yet, so jobs land on the default queue with the
-	// standard retry budget.
+	// We own this run: enqueue a job from the schedule's template. The fired job
+	// inherits the schedule's owning tenant, so scheduler-produced jobs are scoped
+	// exactly like API-produced ones (and pass the enqueuer's tenant guard).
+	// Schedules carry no queue_name of their own yet, so jobs land on the default
+	// queue with the standard retry budget.
 	job := &models.Job{
+		TenantID:   sc.TenantID,
 		JobType:    sc.JobType,
 		Payload:    sc.Payload,
 		MaxRetries: enqueue.DefaultMaxRetries,

@@ -40,10 +40,17 @@ type dashboardResponse struct {
 // active worker count -- the numbers a dashboard's top-line cards need.
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 
-	// Queues to report: configured ones unioned with any seen in the DB, so depth
-	// shows for known queues (even at zero) and for ad-hoc queues that got jobs.
-	dbQueues, err := h.store.QueueNames(ctx)
+	// Queues to report: configured ones unioned with the queues THIS tenant has
+	// used, so depth shows for known queues (even at zero) and for ad-hoc queues
+	// the tenant enqueued to. Note the depth/delayed numbers below come from the
+	// shared Redis lists, so they are queue-global (not per-tenant) -- a known wart
+	// the plan moves to a Postgres per-tenant "pending" count in the metrics phase.
+	dbQueues, err := h.store.QueueNames(ctx, tenantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load queues")
 		return
@@ -63,7 +70,7 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 		depths = append(depths, queueDepth{Queue: name, Depth: depth, Delayed: delayed})
 	}
 
-	m, err := h.store.JobMetrics(ctx)
+	m, err := h.store.JobMetrics(ctx, tenantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load metrics")
 		return
@@ -92,8 +99,12 @@ func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {
 // dashboard reports totals by status, today's job count, and the most recent jobs.
 func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 
-	counts, today, err := h.store.StatusCounts(ctx)
+	counts, today, err := h.store.StatusCounts(ctx, tenantID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load status counts")
 		return
@@ -105,7 +116,7 @@ func (h *Handler) dashboard(w http.ResponseWriter, r *http.Request) {
 		totals[string(st)] = counts[st]
 	}
 
-	recent, _, err := h.store.ListJobs(ctx, store.JobFilter{Limit: recentJobsLimit})
+	recent, _, err := h.store.ListJobs(ctx, tenantID, store.JobFilter{Limit: recentJobsLimit})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to load recent jobs")
 		return

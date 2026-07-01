@@ -18,6 +18,7 @@ import (
 // resumes exactly where the previous one left off.
 type JobSchedule struct {
 	ID             uuid.UUID       `json:"id"`
+	TenantID       uuid.UUID       `json:"tenant_id"` // owning tenant; each fired job inherits it
 	JobType        string          `json:"job_type"`
 	Payload        json.RawMessage `json:"payload"`
 	CronExpression string          `json:"cron_expression"`

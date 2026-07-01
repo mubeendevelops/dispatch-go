@@ -17,9 +17,11 @@ type metricsSource struct {
 	configured []string
 }
 
-// QueueDepths reads each queue's Redis work-list length.
+// QueueDepths reads each queue's Redis work-list length. It uses AllQueueNames
+// (every tenant's queues), not the tenant-scoped QueueNames: job_queue_depth is a
+// global OPERATOR gauge over the shared Redis lists, so it must span all tenants.
 func (s metricsSource) QueueDepths(ctx context.Context) (map[string]int64, error) {
-	dbQueues, err := s.st.QueueNames(ctx)
+	dbQueues, err := s.st.AllQueueNames(ctx)
 	if err != nil {
 		return nil, err
 	}

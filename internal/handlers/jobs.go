@@ -31,12 +31,16 @@ type jobListResponse struct {
 
 // listJobs returns a filtered, paginated page of jobs plus the total match count.
 func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 	p, err := parseListParams(r)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	jobs, total, err := h.store.ListJobs(r.Context(), store.JobFilter{
+	jobs, total, err := h.store.ListJobs(r.Context(), tenantID, store.JobFilter{
 		Queue:  p.Queue,
 		Status: p.Status,
 		Limit:  p.Limit,
@@ -56,6 +60,10 @@ func (h *Handler) listJobs(w http.ResponseWriter, r *http.Request) {
 
 // enqueueJob persists a job, then enqueues its id, and returns the job immediately.
 func (h *Handler) enqueueJob(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 	var req enqueueRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
@@ -76,6 +84,7 @@ func (h *Handler) enqueueJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job := &models.Job{
+		TenantID:   tenantID,
 		QueueName:  req.QueueName,
 		JobType:    req.JobType,
 		Payload:    req.Payload,
@@ -100,12 +109,16 @@ func (h *Handler) enqueueJob(w http.ResponseWriter, r *http.Request) {
 
 // getJob returns a single job by id.
 func (h *Handler) getJob(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid job id")
 		return
 	}
-	job, err := h.store.GetJob(r.Context(), id)
+	job, err := h.store.GetJob(r.Context(), tenantID, id)
 	if err != nil {
 		if errors.Is(err, store.ErrJobNotFound) {
 			writeError(w, http.StatusNotFound, "job not found")
@@ -119,12 +132,16 @@ func (h *Handler) getJob(w http.ResponseWriter, r *http.Request) {
 
 // retryJob resets a failed job to pending and re-enqueues it.
 func (h *Handler) retryJob(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid job id")
 		return
 	}
-	job, err := h.store.RetryJob(r.Context(), id)
+	job, err := h.store.RetryJob(r.Context(), tenantID, id)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrJobNotFound):
@@ -147,12 +164,16 @@ func (h *Handler) retryJob(w http.ResponseWriter, r *http.Request) {
 
 // cancelJob marks a pending job cancelled so it never runs.
 func (h *Handler) cancelJob(w http.ResponseWriter, r *http.Request) {
+	tenantID, ok := h.tenantID(w, r)
+	if !ok {
+		return
+	}
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid job id")
 		return
 	}
-	job, err := h.store.CancelJob(r.Context(), id)
+	job, err := h.store.CancelJob(r.Context(), tenantID, id)
 	if err != nil {
 		switch {
 		case errors.Is(err, store.ErrJobNotFound):

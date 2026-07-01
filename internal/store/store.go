@@ -52,9 +52,10 @@ func (s *Store) Close() { s.pool.Close() }
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 // jobColumns is the canonical column list/order shared by reads so the INSERT's
-// RETURNING and the SELECT scan into scanJob the same way.
+// RETURNING and the SELECT scan into scanJob the same way. tenant_id sits right
+// after id so the owning tenant travels with every job the worker claims.
 const jobColumns = `
-	id, queue_name, job_type, payload, status, result, error_message,
+	id, tenant_id, queue_name, job_type, payload, status, result, error_message,
 	retry_count, max_retries, scheduled_at, started_at, completed_at,
 	created_at, updated_at`
 
@@ -63,19 +64,23 @@ const jobColumns = `
 // enqueue and return that id without a second query.
 func (s *Store) CreateJob(ctx context.Context, job *models.Job) error {
 	const q = `
-		INSERT INTO jobs (id, queue_name, job_type, payload, status, max_retries, scheduled_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO jobs (id, tenant_id, queue_name, job_type, payload, status, max_retries, scheduled_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING ` + jobColumns
 	row := s.pool.QueryRow(ctx, q,
-		job.ID, job.QueueName, job.JobType, job.Payload, job.Status, job.MaxRetries, job.ScheduledAt)
+		job.ID, job.TenantID, job.QueueName, job.JobType, job.Payload, job.Status, job.MaxRetries, job.ScheduledAt)
 	return scanJob(row, job)
 }
 
-// GetJob loads a single job by id, returning ErrJobNotFound if it does not exist.
-func (s *Store) GetJob(ctx context.Context, id uuid.UUID) (*models.Job, error) {
-	const q = `SELECT ` + jobColumns + ` FROM jobs WHERE id = $1`
+// GetJob loads a single job by id, scoped to tenantID, returning ErrJobNotFound if
+// no such job exists for that tenant. This is the security-critical read: the
+// `AND tenant_id = $2` guard is what stops one tenant reading another tenant's job
+// by guessing its UUID. A job owned by a different tenant returns ErrJobNotFound
+// (a 404), identical to a truly missing job, so we don't even leak its existence.
+func (s *Store) GetJob(ctx context.Context, tenantID, id uuid.UUID) (*models.Job, error) {
+	const q = `SELECT ` + jobColumns + ` FROM jobs WHERE id = $1 AND tenant_id = $2`
 	var job models.Job
-	if err := scanJob(s.pool.QueryRow(ctx, q, id), &job); err != nil {
+	if err := scanJob(s.pool.QueryRow(ctx, q, id, tenantID), &job); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrJobNotFound
 		}
@@ -90,6 +95,12 @@ func (s *Store) GetJob(ctx context.Context, id uuid.UUID) (*models.Job, error) {
 // claimed by another worker) it updates no row and ClaimJob returns
 // ErrJobNotClaimable, so the worker skips it instead of running it. This is what
 // makes POST /cancel effective even after the id is already sitting on the queue.
+//
+// Claiming is deliberately NOT tenant-scoped: the worker is trusted first-party
+// infrastructure that legitimately runs jobs across every tenant. It claims by id
+// off the shared queue and gets the owning tenant_id back on the returned row
+// (used later for metering). Tenant scoping governs what a tenant can see/do via
+// the API; it does not constrain the internal worker claim.
 func (s *Store) ClaimJob(ctx context.Context, id uuid.UUID) (*models.Job, error) {
 	const q = `
 		UPDATE jobs SET status = $2, started_at = now()
@@ -148,9 +159,13 @@ func (s *Store) DeadLetter(ctx context.Context, id uuid.UUID, attempts int, reas
 		id, models.StatusFailed, attempts, reason); err != nil {
 		return err
 	}
+	// Derive tenant_id from the job row itself (INSERT ... SELECT) rather than
+	// taking it as a parameter. The DLQ row describes a specific job, so its tenant
+	// must be that job's tenant -- reading it from the just-updated jobs row inside
+	// this same transaction makes divergence structurally impossible.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO dead_letter_queue (job_id, reason, attempts)
-		VALUES ($1, $2, $3)
+		INSERT INTO dead_letter_queue (job_id, tenant_id, reason, attempts)
+		SELECT id, tenant_id, $2, $3 FROM jobs WHERE id = $1
 		ON CONFLICT (job_id) DO UPDATE
 		SET reason = EXCLUDED.reason, attempts = EXCLUDED.attempts`,
 		id, reason, attempts); err != nil {
@@ -162,7 +177,7 @@ func (s *Store) DeadLetter(ctx context.Context, id uuid.UUID, attempts int, reas
 // scanJob reads one row into job using the jobColumns order.
 func scanJob(row pgx.Row, job *models.Job) error {
 	return row.Scan(
-		&job.ID, &job.QueueName, &job.JobType, &job.Payload, &job.Status, &job.Result,
+		&job.ID, &job.TenantID, &job.QueueName, &job.JobType, &job.Payload, &job.Status, &job.Result,
 		&job.ErrorMessage, &job.RetryCount, &job.MaxRetries, &job.ScheduledAt,
 		&job.StartedAt, &job.CompletedAt, &job.CreatedAt, &job.UpdatedAt,
 	)
